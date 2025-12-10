@@ -1,0 +1,35 @@
+[package]
+name = "video-streaming-uploader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+quinn = "0.10"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+ffmpeg-next = { version = "6.0", optional = true }
+proptest = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+rand = "0.8"
+log = "0.4"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1.0"
+tokio-test = "0.4"
+tempfile = "3.0"
+
+[features]
+default = []
+ffmpeg = ["ffmpeg-next"]
+
+[[bin]]
+name = "video-uploader"
+path = "src/main.rs"
