@@ -20,6 +20,7 @@ pub mod app;
 pub mod types;
 pub mod errors;
 pub mod serde_helpers;
+pub mod transmission_config;
 pub mod mock_server;
 pub mod on_demand_uploader;
 

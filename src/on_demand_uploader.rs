@@ -128,8 +128,8 @@ impl OnDemandUploader {
             server_addr,
             crate::types::QUICOptions {
                 max_concurrent_streams: 100,
-                initial_max_data: 10 * 1024 * 1024, // 10MB
-                initial_max_stream_data: 1024 * 1024, // 1MB
+                initial_max_data: 50 * 1024 * 1024, // 50MB - increased for large file transfers
+                initial_max_stream_data: 5 * 1024 * 1024, // 5MB - increased to support 1MB+ segments
                 idle_timeout: std::time::Duration::from_secs(30),
             }
         ).await?;
@@ -308,7 +308,7 @@ impl OnDemandUploader {
     async fn receive_protocol_message(
         recv_stream: &mut quinn::RecvStream
     ) -> Result<crate::types::ProtocolMessage, TransportError> {
-        let data = recv_stream.read_to_end(1024 * 1024).await // 1MB limit
+        let data = recv_stream.read_to_end(2 * 1024 * 1024).await // 2MB limit to accommodate large segments
             .map_err(|e| TransportError::NetworkError { 
                 message: format!("Failed to read message: {}", e) 
             })?;
@@ -931,8 +931,8 @@ impl OnDemandUploader {
         
         info!("Read {} bytes from file: {:?}", file_data.len(), file_info.file_path);
         
-        // 计算分片大小和数量
-        let segment_size = 8192; // 8KB per segment
+        // 计算分片大小和数量 - 使用较小分片避免QUIC流限制
+        let segment_size = 512 * 1024; // 512KB per segment to avoid stream limits
         let total_segments = (file_data.len() + segment_size - 1) / segment_size;
         
         // 更新会话的总分片数
@@ -943,7 +943,7 @@ impl OnDemandUploader {
             }
         }
         
-        info!("File will be transmitted in {} segments of {}KB each", total_segments, segment_size / 1024);
+        info!("File will be transmitted in {} segments of {}KB each (optimized to avoid QUIC stream limits)", total_segments, segment_size / 1024);
         
         // 分片传输文件数据
         for (segment_num, chunk) in file_data.chunks(segment_size).enumerate() {
@@ -1008,9 +1008,11 @@ impl OnDemandUploader {
                     info!("Transmitted real data segment {}/{} ({} bytes) for session {}", 
                           segment_num + 1, total_segments, chunk.len(), session_id);
                     
-                    // 传输延迟（根据播放速率调整）
-                    let delay_ms = (33.0 / playback_rate).clamp(10.0, 100.0) as u64;
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    // 高速传输模式：移除人工延迟以达到最大传输速度
+                    // 可选：每100个分片让出一次CPU，避免阻塞其他任务
+                    if segment_num % 100 == 0 {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 Err(e) => {
                     error!("Failed to send real data segment {}: {}", segment_num + 1, e);

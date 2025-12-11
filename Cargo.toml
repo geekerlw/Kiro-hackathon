@@ -51,3 +51,7 @@ path = "src/bin/test_file_transfer.rs"
 [[bin]]
 name = "demo-low-latency"
 path = "src/bin/demo_low_latency.rs"
+
+[[bin]]
+name = "transmission-benchmark"
+path = "src/bin/transmission_benchmark.rs"

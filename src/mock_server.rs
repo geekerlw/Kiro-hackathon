@@ -358,8 +358,8 @@ impl MockPlatformServer {
                 inner: Arc::new(connection.clone()),
                 config: crate::types::QUICOptions {
                     max_concurrent_streams: 100,
-                    initial_max_data: 10 * 1024 * 1024,
-                    initial_max_stream_data: 1024 * 1024,
+                    initial_max_data: 50 * 1024 * 1024, // 50MB - increased for large file transfers
+                    initial_max_stream_data: 5 * 1024 * 1024, // 5MB - increased to support 1MB+ segments
                     idle_timeout: std::time::Duration::from_secs(30),
                 },
             },
@@ -405,8 +405,8 @@ impl MockPlatformServer {
         mut recv_stream: RecvStream,
         sessions: Arc<Mutex<HashMap<Uuid, ServerSession>>>,
     ) -> Result<(), TransportError> {
-        // 读取流数据
-        let data = recv_stream.read_to_end(1024 * 1024) // 1MB limit
+        // 读取流数据 - 增加限制以支持大分片传输
+        let data = recv_stream.read_to_end(2 * 1024 * 1024) // 2MB limit to accommodate 1MB segments + headers
             .await
             .map_err(|e| TransportError::NetworkError { message: e.to_string() })?;
 
@@ -763,9 +763,11 @@ impl MockPlatformServer {
         let mut server_config = ServerConfig::with_crypto(Arc::new(tls_config));
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         
-        // 配置传输参数
+        // 配置传输参数 - 增加流数据限制以支持大分片传输
         transport_config.max_concurrent_uni_streams(100_u32.into());
         transport_config.max_concurrent_bidi_streams(10_u32.into());
+        transport_config.stream_receive_window((5 * 1024 * 1024u32).try_into().unwrap()); // 5MB per stream
+        transport_config.receive_window((50 * 1024 * 1024u32).try_into().unwrap()); // 50MB total
         transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
 
         Ok(server_config)

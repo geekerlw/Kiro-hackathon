@@ -60,8 +60,8 @@ impl Default for UploadConfig {
             server_address: "127.0.0.1:4433".parse().unwrap(),
             quic_options: QUICOptions {
                 max_concurrent_streams: 100,
-                initial_max_data: 10 * 1024 * 1024, // 10MB
-                initial_max_stream_data: 1024 * 1024, // 1MB
+                initial_max_data: 50 * 1024 * 1024, // 50MB - increased for large file transfers
+                initial_max_stream_data: 5 * 1024 * 1024, // 5MB - increased to support large segments
                 idle_timeout: Duration::from_secs(30),
             },
             segment_options: SegmentOptions {
