@@ -47,6 +47,12 @@ pub struct ReceivingFileInfo {
     pub video_segments: Vec<ReceivedSegment>,
     pub audio_segments: Vec<ReceivedSegment>,
     pub start_time: std::time::SystemTime,
+    // 新增：接收端性能统计
+    pub reception_start_time: Option<std::time::Instant>,
+    pub last_segment_time: Option<std::time::Instant>,
+    pub total_segments_received: u64,
+    pub average_receive_time_ms: f64,
+    pub peak_receive_throughput_mbps: f64,
 }
 
 /// 会话状态
@@ -180,6 +186,12 @@ impl MockPlatformServer {
                 video_segments: Vec::new(),
                 audio_segments: Vec::new(),
                 start_time: std::time::SystemTime::now(),
+                // 初始化接收统计
+                reception_start_time: None,
+                last_segment_time: None,
+                total_segments_received: 0,
+                average_receive_time_ms: 0.0,
+                peak_receive_throughput_mbps: 0.0,
             });
             
             info!("Requested file upload: {} from session {}", file_path, session_id);
@@ -405,10 +417,16 @@ impl MockPlatformServer {
         mut recv_stream: RecvStream,
         sessions: Arc<Mutex<HashMap<Uuid, ServerSession>>>,
     ) -> Result<(), TransportError> {
+        // 记录接收开始时间
+        let receive_start = std::time::Instant::now();
+        
         // 读取流数据 - 增加限制以支持大分片传输
         let data = recv_stream.read_to_end(2 * 1024 * 1024) // 2MB limit to accommodate 1MB segments + headers
             .await
             .map_err(|e| TransportError::NetworkError { message: e.to_string() })?;
+            
+        let receive_end = std::time::Instant::now();
+        let receive_duration = receive_end.duration_since(receive_start);
 
         // 尝试解析为协议消息
         if let Ok(protocol_msg) = serde_json::from_slice::<ProtocolMessage>(&data) {
@@ -468,8 +486,34 @@ impl MockPlatformServer {
             
             // 写入文件数据
             if let Some(ref mut file_info) = session.current_file {
+                // 初始化接收开始时间
+                if file_info.reception_start_time.is_none() {
+                    file_info.reception_start_time = Some(receive_start);
+                }
+                
                 // 更新接收统计
                 file_info.received_size += segment.data.len() as u64;
+                file_info.last_segment_time = Some(receive_end);
+                file_info.total_segments_received += 1;
+                
+                // 计算平均接收时间
+                let total_time = if let Some(start) = file_info.reception_start_time {
+                    receive_end.duration_since(start).as_millis() as f64
+                } else {
+                    receive_duration.as_millis() as f64
+                };
+                file_info.average_receive_time_ms = total_time / file_info.total_segments_received as f64;
+                
+                // 计算当前分片的接收吞吐量
+                let segment_throughput = if receive_duration.as_millis() > 0 {
+                    (segment.data.len() as f64 * 8.0) / (receive_duration.as_millis() as f64 / 1000.0) / 1_000_000.0
+                } else {
+                    0.0
+                };
+                
+                if segment_throughput > file_info.peak_receive_throughput_mbps {
+                    file_info.peak_receive_throughput_mbps = segment_throughput;
+                }
                 
                 // 分类存储分片
                 match stream_type {
@@ -495,11 +539,20 @@ impl MockPlatformServer {
                     &segment_data,
                     segment_timestamp,
                     stream_type,
+                    receive_duration,
                 ).await {
                     error!("Failed to write segment to file: {}", e);
                 } else {
-                    info!("Wrote {} segment {:.3}s ({} bytes) to {:?}", 
-                          segment_type_name, segment_timestamp, segment_data.len(), output_path);
+                    // 计算接收吞吐量
+                    let throughput_mbps = if receive_duration.as_millis() > 0 {
+                        (segment_data.len() as f64 * 8.0) / (receive_duration.as_millis() as f64 / 1000.0) / 1_000_000.0
+                    } else {
+                        0.0
+                    };
+                    
+                    info!("Received {} segment {:.3}s ({} bytes, {:.2}ms, {:.1}Mbps) to {:?}", 
+                          segment_type_name, segment_timestamp, segment_data.len(), 
+                          receive_duration.as_millis(), throughput_mbps, output_path);
                 }
             } else {
                 drop(sessions_guard);
@@ -614,6 +667,7 @@ impl MockPlatformServer {
         segment_data: &[u8],
         timestamp: f64,
         stream_type: StreamType,
+        receive_duration: std::time::Duration,
     ) -> Result<(), std::io::Error> {
         // 确保输出目录存在
         if let Some(parent) = output_path.parent() {
@@ -634,14 +688,23 @@ impl MockPlatformServer {
         raw_file.flush().await?;
         
         // 写入调试信息（用于验证传输）
+        let throughput_mbps = if receive_duration.as_millis() > 0 {
+            (segment_data.len() as f64 * 8.0) / (receive_duration.as_millis() as f64 / 1000.0) / 1_000_000.0
+        } else {
+            0.0
+        };
+        
         let debug_header = format!(
-            "SEGMENT|{}|{:.6}|{}|\n",
+            "SEGMENT|{}|{:.6}|{}|{:.2}ms|{:.1}Mbps|{:?}\n",
             match stream_type {
                 StreamType::Video => "VIDEO",
                 StreamType::Audio => "AUDIO",
             },
             timestamp,
-            segment_data.len()
+            segment_data.len(),
+            receive_duration.as_millis(),
+            throughput_mbps,
+            std::time::SystemTime::now()
         );
         
         let mut debug_file = tokio::fs::OpenOptions::new()
@@ -663,6 +726,11 @@ impl MockPlatformServer {
         if let Some(session) = sessions.get_mut(&session_id) {
             if let Some(file_info) = &session.current_file {
                 let duration = file_info.start_time.elapsed().unwrap_or_default();
+                let reception_duration = if let Some(start) = file_info.reception_start_time {
+                    std::time::Instant::now().duration_since(start)
+                } else {
+                    std::time::Duration::from_millis(0)
+                };
                 let output_path = &file_info.output_path;
                 
                 // 生成统计报告
@@ -670,12 +738,20 @@ impl MockPlatformServer {
                 let raw_video_path = output_path.with_extension("mp4");
                 let debug_info_path = output_path.with_extension("debug");
                 
+                // 计算接收性能统计
+                let overall_receive_throughput = if reception_duration.as_millis() > 0 {
+                    (file_info.received_size as f64 * 8.0) / (reception_duration.as_millis() as f64 / 1000.0) / 1_000_000.0
+                } else {
+                    0.0
+                };
+                
                 let report_content = format!(
                     "=== 文件接收完成报告 ===\n\
                      原始文件: {}\n\
                      会话ID: {}\n\
                      接收开始时间: {:?}\n\
-                     接收耗时: {:.2}秒\n\
+                     总耗时: {:.2}秒\n\
+                     实际接收耗时: {:.2}秒\n\
                      总接收数据: {} bytes\n\
                      视频分片数: {}\n\
                      音频分片数: {}\n\
@@ -686,33 +762,40 @@ impl MockPlatformServer {
                      - 传输调试信息: {:?}\n\
                      - 统计报告文件: {:?}\n\
                      \n\
-                     传输性能:\n\
-                     - 平均传输速率: {:.2} KB/s\n\
+                     接收性能统计:\n\
+                     - 总体接收速率: {:.1} Mbps\n\
+                     - 峰值接收速率: {:.1} Mbps\n\
+                     - 平均分片接收时间: {:.2} ms\n\
                      - 平均分片大小: {:.1} KB\n\
+                     - 接收效率: {:.1}%\n\
                      \n\
                      说明:\n\
                      - .mp4 文件包含原始视频数据，可直接播放\n\
-                     - .debug 文件包含传输调试信息\n\
+                     - .debug 文件包含每个分片的详细接收统计\n\
                      - .report 文件为本统计报告\n\
                      =========================\n",
                     file_info.file_path,
                     session_id,
                     file_info.start_time,
                     duration.as_secs_f64(),
+                    reception_duration.as_secs_f64(),
                     file_info.received_size,
                     file_info.video_segments.len(),
                     file_info.audio_segments.len(),
-                    file_info.video_segments.len() + file_info.audio_segments.len(),
+                    file_info.total_segments_received,
                     raw_video_path,
                     debug_info_path,
                     report_path,
-                    if duration.as_secs_f64() > 0.0 {
-                        file_info.received_size as f64 / 1024.0 / duration.as_secs_f64()
+                    overall_receive_throughput,
+                    file_info.peak_receive_throughput_mbps,
+                    file_info.average_receive_time_ms,
+                    if file_info.total_segments_received > 0 {
+                        file_info.received_size as f64 / 1024.0 / file_info.total_segments_received as f64
                     } else {
                         0.0
                     },
-                    if file_info.video_segments.len() + file_info.audio_segments.len() > 0 {
-                        file_info.received_size as f64 / 1024.0 / (file_info.video_segments.len() + file_info.audio_segments.len()) as f64
+                    if duration.as_secs_f64() > 0.0 {
+                        (reception_duration.as_secs_f64() / duration.as_secs_f64()) * 100.0
                     } else {
                         0.0
                     }
@@ -723,12 +806,14 @@ impl MockPlatformServer {
                 
                 info!("File reception completed for session {}", session_id);
                 info!("  Original file: {}", file_info.file_path);
-                info!("  Received: {} bytes in {:.2}s", file_info.received_size, duration.as_secs_f64());
-                info!("  Video segments: {}, Audio segments: {}", 
-                      file_info.video_segments.len(), file_info.audio_segments.len());
-                info!("  Raw video file: {:?}", output_path.with_extension("mp4"));
-                info!("  Debug info file: {:?}", output_path.with_extension("debug"));
-                info!("  Report file: {:?}", report_path);
+                info!("  Received: {} bytes in {:.2}s (actual reception: {:.2}s)", 
+                      file_info.received_size, duration.as_secs_f64(), reception_duration.as_secs_f64());
+                info!("  Segments: {} total ({} video, {} audio)", 
+                      file_info.total_segments_received, file_info.video_segments.len(), file_info.audio_segments.len());
+                info!("  Performance: {:.1}Mbps overall, {:.1}Mbps peak, avg {:.2}ms/segment", 
+                      overall_receive_throughput, file_info.peak_receive_throughput_mbps, file_info.average_receive_time_ms);
+                info!("  Files: {:?} (video), {:?} (debug), {:?} (report)", 
+                      output_path.with_extension("mp4"), output_path.with_extension("debug"), report_path);
                 
                 // 清理当前文件信息
                 session.current_file = None;

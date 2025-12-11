@@ -57,72 +57,7 @@ impl DefaultVideoSegmenter {
         }
     }
     
-    /// Parse H.264 NAL units to find frame boundaries
-    fn parse_h264_frames(&self, buffer: &[u8]) -> Vec<(usize, bool)> {
-        let mut frames = Vec::new();
-        let mut i = 0;
-        
-        while i < buffer.len().saturating_sub(4) {
-            // Look for NAL unit start codes (0x00000001 or 0x000001)
-            if buffer[i] == 0x00 && buffer[i + 1] == 0x00 {
-                let start_code_len = if buffer[i + 2] == 0x00 && buffer[i + 3] == 0x01 {
-                    4 // 0x00000001
-                } else if buffer[i + 2] == 0x01 {
-                    3 // 0x000001
-                } else {
-                    i += 1;
-                    continue;
-                };
-                
-                if i + start_code_len < buffer.len() {
-                    let nal_type = buffer[i + start_code_len] & 0x1F;
-                    let is_key_frame = matches!(nal_type, 5 | 7 | 8); // IDR, SPS, PPS
-                    frames.push((i, is_key_frame));
-                }
-                
-                i += start_code_len;
-            } else {
-                i += 1;
-            }
-        }
-        
-        frames
-    }
-    
-    /// Parse MP4 boxes to find frame boundaries
-    fn parse_mp4_frames(&self, buffer: &[u8]) -> Vec<(usize, bool)> {
-        let mut frames = Vec::new();
-        let mut i = 0;
-        
-        while i < buffer.len().saturating_sub(8) {
-            // Read box size (4 bytes, big-endian)
-            let box_size = u32::from_be_bytes([
-                buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]
-            ]) as usize;
-            
-            if box_size == 0 || i + box_size > buffer.len() {
-                break;
-            }
-            
-            // Read box type (4 bytes)
-            let box_type = &buffer[i + 4..i + 8];
-            
-            // Check for video sample boxes
-            if box_type == b"mdat" || box_type == b"moof" {
-                // Assume this contains video frames
-                // In a real implementation, we'd parse the actual frame structure
-                frames.push((i, i == 0)); // First frame is key frame
-            }
-            
-            i += box_size;
-        }
-        
-        if frames.is_empty() {
-            frames.push((0, true)); // Fallback: treat entire buffer as one key frame
-        }
-        
-        frames
-    }
+
 }
 
 #[async_trait]
@@ -279,6 +214,73 @@ impl VideoSegmenter for DefaultVideoSegmenter {
 }
 
 impl DefaultVideoSegmenter {
+    /// 公开方法：解析H.264帧
+    pub fn parse_h264_frames(&self, buffer: &[u8]) -> Vec<(usize, bool)> {
+        let mut frames = Vec::new();
+        let mut i = 0;
+        
+        while i < buffer.len().saturating_sub(4) {
+            // Look for NAL unit start codes (0x00000001 or 0x000001)
+            if buffer[i] == 0x00 && buffer[i + 1] == 0x00 {
+                let start_code_len = if buffer[i + 2] == 0x00 && buffer[i + 3] == 0x01 {
+                    4 // 0x00000001
+                } else if buffer[i + 2] == 0x01 {
+                    3 // 0x000001
+                } else {
+                    i += 1;
+                    continue;
+                };
+                
+                if i + start_code_len < buffer.len() {
+                    let nal_type = buffer[i + start_code_len] & 0x1F;
+                    let is_key_frame = matches!(nal_type, 5 | 7 | 8); // IDR, SPS, PPS
+                    frames.push((i, is_key_frame));
+                }
+                
+                i += start_code_len;
+            } else {
+                i += 1;
+            }
+        }
+        
+        frames
+    }
+    
+    /// 公开方法：解析MP4帧
+    pub fn parse_mp4_frames(&self, buffer: &[u8]) -> Vec<(usize, bool)> {
+        let mut frames = Vec::new();
+        let mut i = 0;
+        
+        while i < buffer.len().saturating_sub(8) {
+            // Read box size (4 bytes, big-endian)
+            let box_size = u32::from_be_bytes([
+                buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]
+            ]) as usize;
+            
+            if box_size == 0 || i + box_size > buffer.len() {
+                break;
+            }
+            
+            // Read box type (4 bytes)
+            let box_type = &buffer[i + 4..i + 8];
+            
+            // Check for video sample boxes
+            if box_type == b"mdat" || box_type == b"moof" {
+                // Assume this contains video frames
+                // In a real implementation, we'd parse the actual frame structure
+                frames.push((i, i == 0)); // First frame is key frame
+            }
+            
+            i += box_size;
+        }
+        
+        if frames.is_empty() {
+            frames.push((0, true)); // Fallback: treat entire buffer as one key frame
+        }
+        
+        frames
+    }
+
     fn is_h264_format(&self, buffer: &[u8]) -> bool {
         // Check for H.264 NAL unit start codes
         buffer.len() >= 4 && (

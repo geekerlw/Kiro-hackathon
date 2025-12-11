@@ -42,6 +42,19 @@ impl DefaultAudioVideoSeparator {
         }
     }
     
+    /// 公开方法：检测流类型
+    pub fn detect_stream_types(&self, data: &[u8]) -> (bool, bool) {
+        let has_video = data.windows(4).any(|window| {
+            window == [0x00, 0x00, 0x00, 0x01] || window == [0x00, 0x00, 0x01, 0x00]
+        });
+        
+        let has_audio = data.windows(2).any(|window| {
+            window == [0xFF, 0xF1] || window == [0xFF, 0xF9]
+        });
+        
+        (has_video, has_audio)
+    }
+    
     /// Create a new DefaultAudioVideoSeparator with custom settings
     pub fn with_config(buffer_size: usize, sample_rate: u32, channels: u16) -> Self {
         Self {
@@ -118,18 +131,7 @@ impl DefaultAudioVideoSeparator {
         Ok(segment)
     }
     
-    /// Detect if data contains both audio and video streams
-    fn detect_stream_types(&self, data: &[u8]) -> (bool, bool) {
-        let has_video = data.windows(4).any(|window| {
-            window == [0x00, 0x00, 0x00, 0x01] || window == [0x00, 0x00, 0x01, 0x00]
-        });
-        
-        let has_audio = data.windows(2).any(|window| {
-            window == [0xFF, 0xF1] || window == [0xFF, 0xF9]
-        });
-        
-        (has_video, has_audio)
-    }
+
 }
 
 impl Default for DefaultAudioVideoSeparator {

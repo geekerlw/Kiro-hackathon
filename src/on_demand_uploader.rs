@@ -55,6 +55,12 @@ pub struct UploadSession {
     pub start_time: std::time::SystemTime,
     pub video_stream_id: Option<u64>,
     pub audio_stream_id: Option<u64>,
+    // 新增：准确的时间统计
+    pub transmission_start_time: Option<std::time::Instant>,
+    pub last_segment_time: Option<std::time::Instant>,
+    pub total_bytes_transmitted: u64,
+    pub average_segment_time_ms: f64,
+    pub peak_throughput_mbps: f64,
 }
 
 /// 上传状态
@@ -496,6 +502,12 @@ impl OnDemandUploader {
                         start_time: std::time::SystemTime::now(),
                         video_stream_id: None,
                         audio_stream_id: None,
+                        // 初始化时间统计
+                        transmission_start_time: None,
+                        last_segment_time: None,
+                        total_bytes_transmitted: 0,
+                        average_segment_time_ms: 0.0,
+                        peak_throughput_mbps: 0.0,
                     };
                     
                     active_sessions.write().await.insert(session_id, session);
@@ -854,25 +866,13 @@ impl OnDemandUploader {
                 })
             };
 
-            // 极低延迟传输时间（根据播放速率调整）
-            let sessions = active_sessions.read().await;
-            let transmission_delay = if let Some(session) = sessions.get(&session_id) {
-                // 基础传输时间33ms（对应30fps），根据播放速率调整
-                let base_delay = 33.0; // 33ms for 30fps low latency
-                let adjusted_delay = base_delay / session.playback_rate;
-                // 最小延迟不低于10ms，最大不超过100ms
-                let clamped_delay = adjusted_delay.clamp(10.0, 100.0);
-                std::time::Duration::from_millis(clamped_delay as u64)
-            } else {
-                std::time::Duration::from_millis(33) // Default 33ms for 30fps
-            };
-            drop(sessions);
-
             // 实际发送分片数据到服务器
             match transport.send_segment(&mut connection, segment).await {
                 Ok(_) => {
-                    // 模拟传输延迟
-                    tokio::time::sleep(transmission_delay).await;
+                    // 极低延迟模式：最大速度传输，仅在必要时让出CPU
+                    if segment_num % 20 == 0 {
+                        tokio::task::yield_now().await;
+                    }
 
                     // 更新传输进度
                     {
@@ -909,19 +909,19 @@ impl OnDemandUploader {
         Ok(())
     }
 
-    /// 真实文件传输过程
+    /// 真实文件传输过程 - 使用帧级分片和音视频分离
     async fn real_file_transmission(
         session_id: Uuid,
         file_info: &LocalFileInfo,
-        mut file_handle: tokio::fs::File,
-        seek_position: Option<f64>,
-        playback_rate: f64,
+        _file_handle: tokio::fs::File,
+        _seek_position: Option<f64>,
+        _playback_rate: f64,
         active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
-        file_reader: Arc<DefaultFileStreamReader>,
+        _file_reader: Arc<DefaultFileStreamReader>,
         transport: Arc<DefaultQUICTransport>,
         mut connection: QUICConnection,
     ) -> Result<(), UploadManagerError> {
-        info!("Starting real file transmission for session {}", session_id);
+        info!("Starting intelligent file transmission for session {} with format: {}", session_id, file_info.format);
         
         // 读取整个文件内容
         let file_data = std::fs::read(&file_info.file_path)
@@ -931,63 +931,369 @@ impl OnDemandUploader {
         
         info!("Read {} bytes from file: {:?}", file_data.len(), file_info.file_path);
         
-        // 计算分片大小和数量 - 使用较小分片避免QUIC流限制
-        let segment_size = 512 * 1024; // 512KB per segment to avoid stream limits
+        // 根据文件格式选择最优处理策略
+        match file_info.format.as_str() {
+            "h264" => {
+                info!("Processing H.264 file with frame-level segmentation (low latency mode)");
+                Self::process_h264_file(
+                    session_id,
+                    &file_data,
+                    active_sessions,
+                    transport,
+                    connection,
+                ).await
+            }
+            "mp4" => {
+                info!("Processing MP4 file with fixed-size segmentation (high throughput mode)");
+                Self::process_mp4_file(
+                    session_id,
+                    &file_data,
+                    active_sessions,
+                    transport,
+                    connection,
+                ).await
+            }
+            _ => {
+                warn!("Unknown format {}, falling back to generic segmentation", file_info.format);
+                Self::process_generic_file(
+                    session_id,
+                    &file_data,
+                    active_sessions,
+                    transport,
+                    connection,
+                ).await
+            }
+        }
+    }
+    
+    /// 处理H.264文件 - 真正的帧级分片
+    async fn process_h264_file(
+        session_id: Uuid,
+        file_data: &[u8],
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
+        mut connection: QUICConnection,
+    ) -> Result<(), UploadManagerError> {
+        info!("Starting H.264 frame-level processing for session {}", session_id);
+        
+        // 创建视频分片器
+        let segmenter = DefaultVideoSegmenter::with_frame_rate(30.0);
+        
+        // 解析H.264帧
+        let frames = segmenter.parse_h264_frames(file_data);
+        info!("Found {} H.264 frames in file", frames.len());
+        
+        // 记录传输开始时间并更新会话信息
+        let transmission_start = std::time::Instant::now();
+        {
+            let mut sessions = active_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.total_segments = frames.len() as u64;
+                session.transmission_start_time = Some(transmission_start);
+                session.total_bytes_transmitted = 0;
+            }
+        }
+        
+        // 逐帧传输
+        for (frame_index, (frame_pos, is_key_frame)) in frames.iter().enumerate() {
+            // 检查会话状态
+            if !Self::check_session_active(session_id, &active_sessions).await? {
+                return Ok(());
+            }
+            
+            // 计算帧数据范围
+            let frame_end = if frame_index + 1 < frames.len() {
+                frames[frame_index + 1].0
+            } else {
+                file_data.len()
+            };
+            
+            let frame_data = &file_data[*frame_pos..frame_end];
+            
+            // 提取编码参数
+            let encoding_params = segmenter.extract_encoding_params(frame_data);
+            
+            // 创建帧级视频分片
+            let segment = crate::types::Segment::Video(crate::types::VideoSegment {
+                id: Uuid::new_v4(),
+                data: frame_data.to_vec(),
+                timestamp: frame_index as f64 / 30.0, // 30fps
+                duration: 1.0 / 30.0, // 33.33ms per frame
+                frame_count: 1,
+                is_key_frame: *is_key_frame,
+                metadata: crate::types::SegmentMetadata {
+                    frame_indices: vec![frame_index],
+                    key_frame_positions: if *is_key_frame { vec![0] } else { vec![] },
+                    encoding_params,
+                },
+            });
+            
+            // 发送帧到服务器
+            let segment_start = std::time::Instant::now();
+            match transport.send_segment(&mut connection, segment).await {
+                Ok(_) => {
+                    let segment_end = std::time::Instant::now();
+                    let segment_duration = segment_end.duration_since(segment_start);
+                    
+                    // 更新传输进度和统计信息
+                    {
+                        let mut sessions = active_sessions.write().await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.uploaded_segments = (frame_index + 1) as u64;
+                            session.last_segment_time = Some(segment_end);
+                            session.total_bytes_transmitted += frame_data.len() as u64;
+                            
+                            // 计算平均分片传输时间
+                            let total_time = if let Some(start) = session.transmission_start_time {
+                                segment_end.duration_since(start).as_millis() as f64
+                            } else {
+                                segment_duration.as_millis() as f64
+                            };
+                            session.average_segment_time_ms = total_time / session.uploaded_segments as f64;
+                            
+                            // 计算当前吞吐量 (Mbps)
+                            let segment_throughput = if segment_duration.as_millis() > 0 {
+                                (frame_data.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0
+                            } else {
+                                0.0
+                            };
+                            
+                            if segment_throughput > session.peak_throughput_mbps {
+                                session.peak_throughput_mbps = segment_throughput;
+                            }
+                        }
+                    }
+                    
+                    info!("Transmitted H.264 frame {}/{} ({} bytes, {}, {:.2}ms, {:.1}Mbps) for session {}", 
+                          frame_index + 1, frames.len(), frame_data.len(),
+                          if *is_key_frame { "KEY" } else { "P/B" },
+                          segment_duration.as_millis(),
+                          (frame_data.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0,
+                          session_id);
+                    
+                    // 极低延迟模式：最大速度传输，仅在必要时让出CPU
+                    if frame_index % 10 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to send H.264 frame {}: {}", frame_index + 1, e);
+                    Self::mark_session_error(session_id, &active_sessions, e.to_string()).await;
+                    return Err(UploadManagerError::TransportError(e));
+                }
+            }
+        }
+        
+        // 计算并显示传输统计
+        let (total_time, total_bytes, avg_time, peak_throughput) = {
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                let total_time = if let Some(start) = session.transmission_start_time {
+                    std::time::Instant::now().duration_since(start)
+                } else {
+                    std::time::Duration::from_millis(0)
+                };
+                (total_time, session.total_bytes_transmitted, session.average_segment_time_ms, session.peak_throughput_mbps)
+            } else {
+                (std::time::Duration::from_millis(0), 0, 0.0, 0.0)
+            }
+        };
+        
+        let overall_throughput = if total_time.as_millis() > 0 {
+            (total_bytes as f64 * 8.0) / (total_time.as_millis() as f64 / 1000.0) / 1_000_000.0
+        } else {
+            0.0
+        };
+        
+        info!("H.264 frame-level transmission completed for session {} ({} frames, {} bytes, {:.2}s, avg {:.2}ms/frame, {:.1}Mbps overall, {:.1}Mbps peak)", 
+              session_id, frames.len(), total_bytes, total_time.as_secs_f64(), avg_time, overall_throughput, peak_throughput);
+        Ok(())
+    }
+    
+    /// 处理MP4文件 - 使用固定大小分片（高效传输）
+    async fn process_mp4_file(
+        session_id: Uuid,
+        file_data: &[u8],
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
+        mut connection: QUICConnection,
+    ) -> Result<(), UploadManagerError> {
+        info!("Starting MP4 file processing with fixed-size segmentation for session {}", session_id);
+        
+        // MP4文件使用固定大小分片，避免复杂的音视频分离导致的问题
+        let segment_size = 256 * 1024; // 256KB per segment - 更小的分片避免stream too long
         let total_segments = (file_data.len() + segment_size - 1) / segment_size;
         
-        // 更新会话的总分片数
+        // 记录传输开始时间并更新会话信息
+        let transmission_start = std::time::Instant::now();
         {
             let mut sessions = active_sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
                 session.total_segments = total_segments as u64;
+                session.transmission_start_time = Some(transmission_start);
+                session.total_bytes_transmitted = 0;
             }
         }
         
-        info!("File will be transmitted in {} segments of {}KB each (optimized to avoid QUIC stream limits)", total_segments, segment_size / 1024);
+        info!("MP4 file will be transmitted in {} segments of {}KB each (optimized for reliability)", 
+              total_segments, segment_size / 1024);
+        
+        // 分片传输MP4文件数据
+        for (segment_num, chunk) in file_data.chunks(segment_size).enumerate() {
+            if !Self::check_session_active(session_id, &active_sessions).await? {
+                return Ok(());
+            }
+            
+            // 创建MP4视频分片
+            let segment = crate::types::Segment::Video(crate::types::VideoSegment {
+                id: Uuid::new_v4(),
+                data: chunk.to_vec(),
+                timestamp: segment_num as f64 * 0.1, // 100ms per segment for MP4
+                duration: 0.1, // 100ms duration
+                frame_count: 1,
+                is_key_frame: segment_num % 10 == 0, // 每10个分片一个关键帧标记
+                metadata: crate::types::SegmentMetadata {
+                    frame_indices: vec![segment_num],
+                    key_frame_positions: if segment_num % 10 == 0 { vec![0] } else { vec![] },
+                    encoding_params: {
+                        let mut params = std::collections::HashMap::new();
+                        params.insert("container".to_string(), "mp4".to_string());
+                        params.insert("segment_size".to_string(), chunk.len().to_string());
+                        params.insert("segment_mode".to_string(), "fixed_size".to_string());
+                        params.insert("optimized_for".to_string(), "reliability".to_string());
+                        params
+                    },
+                },
+            });
+            
+            // 发送分片到服务器
+            let segment_start = std::time::Instant::now();
+            match transport.send_segment(&mut connection, segment).await {
+                Ok(_) => {
+                    let segment_end = std::time::Instant::now();
+                    let segment_duration = segment_end.duration_since(segment_start);
+                    
+                    // 更新传输进度和统计信息
+                    {
+                        let mut sessions = active_sessions.write().await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.uploaded_segments = (segment_num + 1) as u64;
+                            session.last_segment_time = Some(segment_end);
+                            session.total_bytes_transmitted += chunk.len() as u64;
+                            
+                            // 计算平均分片传输时间
+                            let total_time = if let Some(start) = session.transmission_start_time {
+                                segment_end.duration_since(start).as_millis() as f64
+                            } else {
+                                segment_duration.as_millis() as f64
+                            };
+                            session.average_segment_time_ms = total_time / session.uploaded_segments as f64;
+                            
+                            // 计算当前吞吐量 (Mbps)
+                            let segment_throughput = if segment_duration.as_millis() > 0 {
+                                (chunk.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0
+                            } else {
+                                0.0
+                            };
+                            
+                            if segment_throughput > session.peak_throughput_mbps {
+                                session.peak_throughput_mbps = segment_throughput;
+                            }
+                        }
+                    }
+                    
+                    info!("Transmitted MP4 segment {}/{} ({} bytes, {:.2}ms, {:.1}Mbps) for session {}", 
+                          segment_num + 1, total_segments, chunk.len(),
+                          segment_duration.as_millis(),
+                          (chunk.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0,
+                          session_id);
+                    
+                    // 极低延迟模式：最大速度传输，仅在必要时让出CPU
+                    if segment_num % 50 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to send MP4 segment {}: {}", segment_num + 1, e);
+                    Self::mark_session_error(session_id, &active_sessions, e.to_string()).await;
+                    return Err(UploadManagerError::TransportError(e));
+                }
+            }
+        }
+        
+        // 计算并显示传输统计
+        let (total_time, total_bytes, avg_time, peak_throughput) = {
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                let total_time = if let Some(start) = session.transmission_start_time {
+                    std::time::Instant::now().duration_since(start)
+                } else {
+                    std::time::Duration::from_millis(0)
+                };
+                (total_time, session.total_bytes_transmitted, session.average_segment_time_ms, session.peak_throughput_mbps)
+            } else {
+                (std::time::Duration::from_millis(0), 0, 0.0, 0.0)
+            }
+        };
+        
+        let overall_throughput = if total_time.as_millis() > 0 {
+            (total_bytes as f64 * 8.0) / (total_time.as_millis() as f64 / 1000.0) / 1_000_000.0
+        } else {
+            0.0
+        };
+        
+        info!("MP4 file transmission completed for session {} ({} segments, {} bytes, {:.2}s, avg {:.2}ms/segment, {:.1}Mbps overall, {:.1}Mbps peak)", 
+              session_id, total_segments, total_bytes, total_time.as_secs_f64(), avg_time, overall_throughput, peak_throughput);
+        Ok(())
+    }
+    
+    /// 处理通用文件 - 简单分片
+    async fn process_generic_file(
+        session_id: Uuid,
+        file_data: &[u8],
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
+        mut connection: QUICConnection,
+    ) -> Result<(), UploadManagerError> {
+        info!("Starting generic file processing for session {}", session_id);
+        
+        // 使用较小分片避免QUIC流限制
+        let segment_size = 512 * 1024; // 512KB per segment
+        let total_segments = (file_data.len() + segment_size - 1) / segment_size;
+        
+        // 记录传输开始时间并更新会话信息
+        let transmission_start = std::time::Instant::now();
+        {
+            let mut sessions = active_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.total_segments = total_segments as u64;
+                session.transmission_start_time = Some(transmission_start);
+                session.total_bytes_transmitted = 0;
+            }
+        }
+        
+        info!("File will be transmitted in {} segments of {}KB each", total_segments, segment_size / 1024);
         
         // 分片传输文件数据
         for (segment_num, chunk) in file_data.chunks(segment_size).enumerate() {
-            // 检查会话状态
-            let should_continue = {
-                let sessions = active_sessions.read().await;
-                if let Some(session) = sessions.get(&session_id) {
-                    match session.status {
-                        UploadStatus::Active => true,
-                        UploadStatus::Paused => {
-                            info!("Session {} paused, waiting...", session_id);
-                            false
-                        }
-                        UploadStatus::Completed => {
-                            info!("Session {} completed, stopping transmission", session_id);
-                            return Ok(());
-                        }
-                        _ => true,
-                    }
-                } else {
-                    warn!("Session {} not found, stopping transmission", session_id);
-                    return Ok(());
-                }
-            };
-            
-            if !should_continue {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
+            if !Self::check_session_active(session_id, &active_sessions).await? {
+                return Ok(());
             }
             
-            // 创建真实的视频分片
+            // 创建通用视频分片
             let segment = crate::types::Segment::Video(crate::types::VideoSegment {
                 id: Uuid::new_v4(),
-                data: chunk.to_vec(), // 真实的文件数据
-                timestamp: segment_num as f64 * 0.033, // 33ms per segment
+                data: chunk.to_vec(),
+                timestamp: segment_num as f64 * 0.033,
                 duration: 0.033,
                 frame_count: 1,
-                is_key_frame: segment_num % 30 == 0, // 每30个分片一个关键帧
+                is_key_frame: segment_num % 30 == 0,
                 metadata: crate::types::SegmentMetadata {
                     frame_indices: vec![0],
                     key_frame_positions: if segment_num % 30 == 0 { vec![0] } else { vec![] },
                     encoding_params: {
                         let mut params = std::collections::HashMap::new();
-                        params.insert("real_data".to_string(), "true".to_string());
+                        params.insert("generic_data".to_string(), "true".to_string());
                         params.insert("segment_size".to_string(), chunk.len().to_string());
                         params
                     },
@@ -995,40 +1301,123 @@ impl OnDemandUploader {
             });
             
             // 发送分片到服务器
+            let segment_start = std::time::Instant::now();
             match transport.send_segment(&mut connection, segment).await {
                 Ok(_) => {
-                    // 更新传输进度
+                    let segment_end = std::time::Instant::now();
+                    let segment_duration = segment_end.duration_since(segment_start);
+                    
+                    // 更新传输进度和统计信息
                     {
                         let mut sessions = active_sessions.write().await;
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.uploaded_segments = (segment_num + 1) as u64;
+                            session.last_segment_time = Some(segment_end);
+                            session.total_bytes_transmitted += chunk.len() as u64;
+                            
+                            // 计算平均分片传输时间
+                            let total_time = if let Some(start) = session.transmission_start_time {
+                                segment_end.duration_since(start).as_millis() as f64
+                            } else {
+                                segment_duration.as_millis() as f64
+                            };
+                            session.average_segment_time_ms = total_time / session.uploaded_segments as f64;
+                            
+                            // 计算当前吞吐量 (Mbps)
+                            let segment_throughput = if segment_duration.as_millis() > 0 {
+                                (chunk.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0
+                            } else {
+                                0.0
+                            };
+                            
+                            if segment_throughput > session.peak_throughput_mbps {
+                                session.peak_throughput_mbps = segment_throughput;
+                            }
                         }
                     }
                     
-                    info!("Transmitted real data segment {}/{} ({} bytes) for session {}", 
-                          segment_num + 1, total_segments, chunk.len(), session_id);
+                    info!("Transmitted generic segment {}/{} ({} bytes, {:.2}ms, {:.1}Mbps) for session {}", 
+                          segment_num + 1, total_segments, chunk.len(),
+                          segment_duration.as_millis(),
+                          (chunk.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0,
+                          session_id);
                     
-                    // 高速传输模式：移除人工延迟以达到最大传输速度
-                    // 可选：每100个分片让出一次CPU，避免阻塞其他任务
+                    // 极低延迟模式：最大速度传输，仅在必要时让出CPU
                     if segment_num % 100 == 0 {
                         tokio::task::yield_now().await;
                     }
                 }
                 Err(e) => {
-                    error!("Failed to send real data segment {}: {}", segment_num + 1, e);
-                    // 更新会话状态为错误
-                    let mut sessions = active_sessions.write().await;
-                    if let Some(session) = sessions.get_mut(&session_id) {
-                        session.status = UploadStatus::Error(format!("Transmission failed: {}", e));
-                    }
+                    error!("Failed to send generic segment {}: {}", segment_num + 1, e);
+                    Self::mark_session_error(session_id, &active_sessions, e.to_string()).await;
                     return Err(UploadManagerError::TransportError(e));
                 }
             }
         }
         
-        info!("Real file transmission completed for session {} ({} segments, {} bytes)", 
-              session_id, total_segments, file_data.len());
+        // 计算并显示传输统计
+        let (total_time, total_bytes, avg_time, peak_throughput) = {
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                let total_time = if let Some(start) = session.transmission_start_time {
+                    std::time::Instant::now().duration_since(start)
+                } else {
+                    std::time::Duration::from_millis(0)
+                };
+                (total_time, session.total_bytes_transmitted, session.average_segment_time_ms, session.peak_throughput_mbps)
+            } else {
+                (std::time::Duration::from_millis(0), 0, 0.0, 0.0)
+            }
+        };
+        
+        let overall_throughput = if total_time.as_millis() > 0 {
+            (total_bytes as f64 * 8.0) / (total_time.as_millis() as f64 / 1000.0) / 1_000_000.0
+        } else {
+            0.0
+        };
+        
+        info!("Generic file transmission completed for session {} ({} segments, {} bytes, {:.2}s, avg {:.2}ms/segment, {:.1}Mbps overall, {:.1}Mbps peak)", 
+              session_id, total_segments, total_bytes, total_time.as_secs_f64(), avg_time, overall_throughput, peak_throughput);
         Ok(())
+    }
+    
+    /// 检查会话是否仍然活跃
+    async fn check_session_active(
+        session_id: Uuid,
+        active_sessions: &Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+    ) -> Result<bool, UploadManagerError> {
+        let sessions = active_sessions.read().await;
+        if let Some(session) = sessions.get(&session_id) {
+            match session.status {
+                UploadStatus::Active => Ok(true),
+                UploadStatus::Paused => {
+                    info!("Session {} paused, waiting...", session_id);
+                    drop(sessions);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Ok(false)
+                }
+                UploadStatus::Completed => {
+                    info!("Session {} completed, stopping transmission", session_id);
+                    Ok(false)
+                }
+                _ => Ok(true),
+            }
+        } else {
+            warn!("Session {} not found, stopping transmission", session_id);
+            Ok(false)
+        }
+    }
+    
+    /// 标记会话错误
+    async fn mark_session_error(
+        session_id: Uuid,
+        active_sessions: &Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        error_message: String,
+    ) {
+        let mut sessions = active_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.status = UploadStatus::Error(format!("Transmission failed: {}", error_message));
+        }
     }
 }
 
