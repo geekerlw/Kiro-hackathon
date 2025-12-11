@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 use tokio_stream::Stream;
 
@@ -137,7 +138,7 @@ pub struct QUICOptions {
 }
 
 // Stream types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum StreamType {
     Video,
     Audio,
@@ -179,15 +180,17 @@ pub enum CongestionLevel {
 }
 
 // Protocol message types for language-agnostic communication
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProtocolMessage {
     pub message_type: MessageType,
     pub payload: Vec<u8>,
     pub sequence_number: u64,
+    #[serde(with = "crate::serde_helpers::systemtime")]
     pub timestamp: SystemTime,
+    pub session_id: Uuid,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MessageType {
     SessionStart = 0x01,
     SessionEnd = 0x02,
@@ -199,6 +202,10 @@ pub enum MessageType {
     StatsRequest = 0x08,
     StatusResponse = 0x09,
     VersionNegotiation = 0x0A,
+    FileRequest = 0x0B,
+    PlaybackControl = 0x0C,
+    FileListQuery = 0x0D,
+    FileListResponse = 0x0E,
 }
 
 // Protocol version information
@@ -435,12 +442,13 @@ pub struct BufferHealth {
 }
 
 // QUIC connection and stream types
+#[derive(Clone)]
 pub struct QUICConnection {
     pub id: Uuid,
     pub remote_address: std::net::SocketAddr,
     pub established_at: SystemTime,
     pub stats: ConnectionStats,
-    pub inner: quinn::Connection,
+    pub inner: Arc<quinn::Connection>,
     pub config: QUICOptions,
 }
 

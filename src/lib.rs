@@ -20,6 +20,8 @@ pub mod app;
 pub mod types;
 pub mod errors;
 pub mod serde_helpers;
+pub mod mock_server;
+pub mod on_demand_uploader;
 
 pub use types::*;
 pub use errors::*;

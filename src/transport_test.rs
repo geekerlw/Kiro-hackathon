@@ -66,6 +66,7 @@ mod tests {
             payload: vec![1, 2, 3],
             sequence_number: 42,
             timestamp: std::time::SystemTime::now(),
+            session_id: uuid::Uuid::new_v4(),
         };
 
         assert_eq!(message.sequence_number, 42);

@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use async_trait::async_trait;
 use quinn::{ClientConfig, Endpoint};
+use uuid::Uuid;
 use crate::types::{QUICConnection, QUICOptions, QUICStream, StreamType, Segment, ConnectionStats};
 use crate::errors::TransportError;
 use std::time::{Duration, SystemTime, Instant};
@@ -165,7 +166,7 @@ impl QUICTransport for DefaultQUICTransport {
             remote_address: server_address,
             established_at: SystemTime::now(),
             stats,
-            inner: connection,
+            inner: Arc::new(connection),
             config: options,
         })
     }
@@ -407,6 +408,7 @@ impl QUICTransport for DefaultQUICTransport {
             payload: self.serialize_version(&client_version)?,
             sequence_number: 1,
             timestamp: SystemTime::now(),
+            session_id: Uuid::new_v4(),
         };
 
         self.send_protocol_message(connection, version_message).await?;

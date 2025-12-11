@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::collections::HashMap;
 use async_trait::async_trait;
 use tokio::time::sleep;
+use uuid::Uuid;
 use crate::errors::{TransportError, NetworkError};
 use crate::types::{
     QUICConnection, QUICOptions, RecoveryState,
@@ -239,6 +240,7 @@ impl DefaultNetworkErrorHandler {
                 payload: vec![200, 0], // Success status
                 sequence_number: 1,
                 timestamp: SystemTime::now(),
+                session_id: Uuid::new_v4(),
             })
         })
         .await
@@ -345,6 +347,7 @@ impl NetworkErrorHandler for DefaultNetworkErrorHandler {
                     payload: b"reauthenticate".to_vec(),
                     sequence_number: connection.id.as_u128() as u64,
                     timestamp: SystemTime::now(),
+                    session_id: connection.id,
                 };
                 self.send_protocol_message_safe(connection, auth_message).await?;
             }
@@ -390,6 +393,7 @@ impl NetworkErrorHandler for DefaultNetworkErrorHandler {
             payload: version_payload,
             sequence_number: 1,
             timestamp: SystemTime::now(),
+            session_id: Uuid::new_v4(),
         };
 
         self.send_protocol_message_safe(connection, negotiation_message).await?;
@@ -513,6 +517,7 @@ impl NetworkErrorHandler for DefaultNetworkErrorHandler {
             payload: format!("ACK:{}", error_code).into_bytes(),
             sequence_number: connection.id.as_u128() as u64,
             timestamp: SystemTime::now(),
+            session_id: connection.id,
         };
 
         self.send_protocol_message_safe(connection, error_response).await?;

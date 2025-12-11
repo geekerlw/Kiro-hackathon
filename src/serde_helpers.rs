@@ -47,3 +47,21 @@ where
     let millis: Vec<u128> = Vec::deserialize(deserializer)?;
     Ok(millis.into_iter().map(|m| Duration::from_millis(m as u64)).collect())
 }
+
+pub mod systemtime {
+    use super::*;
+    
+    pub fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_system_time(time, serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_system_time(deserializer)
+    }
+}

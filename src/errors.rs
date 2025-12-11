@@ -20,6 +20,9 @@ pub enum FileError {
     
     #[error("Invalid file metadata")]
     InvalidMetadata,
+    
+    #[error("IO error: {message}")]
+    IoError { message: String },
 }
 
 #[derive(Error, Debug)]
@@ -78,6 +81,18 @@ pub enum TransportError {
     #[error("Protocol version mismatch: client {client_version}, server {server_version}")]
     ProtocolMismatch { client_version: String, server_version: String },
     
+    #[error("Serialization error: {message}")]
+    SerializationError { message: String },
+    
+    #[error("Network error: {message}")]
+    NetworkError { message: String },
+    
+    #[error("Invalid data: {message}")]
+    InvalidData { message: String },
+    
+    #[error("Configuration error: {message}")]
+    ConfigurationError { message: String },
+    
     #[error("Stream creation failed: {reason}")]
     StreamCreationFailed { reason: String },
     
@@ -101,9 +116,6 @@ pub enum TransportError {
     
     #[error("Protocol error: {error_code} - {description}")]
     ProtocolError { error_code: u16, description: String },
-    
-    #[error("Serialization error: {message}")]
-    SerializationError { message: String },
     
     #[error("Deserialization error: {message}")]
     DeserializationError { message: String },
@@ -233,6 +245,9 @@ pub enum UploadManagerError {
     
     #[error("Resource error: {0}")]
     ResourceError(#[from] ResourceError),
+    
+    #[error("File not found: {0}")]
+    FileNotFound(String),
     
     #[error("Session already active")]
     SessionAlreadyActive,

@@ -20,6 +20,8 @@ log = "0.4"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = "4.0"
+rcgen = "0.12"
 
 [dev-dependencies]
 proptest = "1.0"
@@ -33,3 +35,19 @@ ffmpeg = ["ffmpeg-next"]
 [[bin]]
 name = "video-uploader"
 path = "src/main.rs"
+
+[[bin]]
+name = "mock-server"
+path = "src/bin/mock_server.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "test-file-transfer"
+path = "src/bin/test_file_transfer.rs"
+
+[[bin]]
+name = "demo-low-latency"
+path = "src/bin/demo_low_latency.rs"
