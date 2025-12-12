@@ -1,11 +1,13 @@
 use async_trait::async_trait;
-use crate::types::{VideoSegment, AudioSegment, DropFrameStrategy, SyncInfo, BufferManager};
+use crate::types::{VideoSegment, AudioSegment, DropFrameStrategy, SyncInfo, BufferManager, KeyframeIndex, KeyframeEntry, SeekResult};
 use crate::errors::PlaybackError;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 #[async_trait]
 pub trait PlaybackController {
     async fn seek(&mut self, position: f64) -> Result<(), PlaybackError>;
+    async fn seek_to_keyframe(&mut self, position: f64, index: &KeyframeIndex) -> Result<SeekResult, PlaybackError>;
     async fn set_playback_rate(&mut self, rate: f64) -> Result<(), PlaybackError>;
     fn get_drop_frame_strategy(&self, rate: f64) -> DropFrameStrategy;
     fn adjust_transmission_queue(
@@ -15,6 +17,7 @@ pub trait PlaybackController {
     ) -> Vec<VideoSegment>;
     fn clear_buffers(&mut self) -> Result<(), PlaybackError>;
     fn find_segment_at_position(&self, segments: &[VideoSegment], position: f64) -> Option<usize>;
+    fn find_nearest_keyframe(&self, timestamp: f64, index: &KeyframeIndex) -> Option<KeyframeEntry>;
     fn adjust_audio_video_sync(&mut self, playback_rate: f64) -> SyncInfo;
 }
 
@@ -74,6 +77,47 @@ impl PlaybackController for DefaultPlaybackController {
         self.sync_offset = 0.0;
         
         Ok(())
+    }
+
+    async fn seek_to_keyframe(&mut self, position: f64, index: &KeyframeIndex) -> Result<SeekResult, PlaybackError> {
+        let start_time = Instant::now();
+        
+        if position < 0.0 || position > index.total_duration {
+            return Err(PlaybackError::InvalidSeekPosition { position });
+        }
+        
+        // Find the nearest keyframe using the keyframe index
+        let keyframe_entry = self.find_nearest_keyframe(position, index)
+            .ok_or(PlaybackError::KeyframeNotFound { timestamp: position })?;
+        
+        // Clear current transmission buffers before seeking
+        self.clear_buffers()?;
+        
+        // Update current position to the keyframe position
+        let actual_time = keyframe_entry.timestamp;
+        self.current_position = actual_time;
+        self.last_seek_position = Some(actual_time);
+        
+        // Reset sync offset after seek
+        self.sync_offset = 0.0;
+        
+        // Calculate seek precision achieved
+        let precision_achieved = if (position - actual_time).abs() < f64::EPSILON {
+            1.0 // Perfect precision
+        } else {
+            1.0 - ((position - actual_time).abs() / position).min(1.0)
+        };
+        
+        let execution_time = start_time.elapsed();
+        
+        Ok(SeekResult {
+            requested_time: position,
+            actual_time,
+            keyframe_offset: keyframe_entry.file_offset,
+            precision_achieved,
+            keyframe_used: keyframe_entry,
+            execution_time,
+        })
     }
 
     async fn set_playback_rate(&mut self, rate: f64) -> Result<(), PlaybackError> {
@@ -188,6 +232,45 @@ impl PlaybackController for DefaultPlaybackController {
         }
         
         closest_index
+    }
+
+    fn find_nearest_keyframe(&self, timestamp: f64, index: &KeyframeIndex) -> Option<KeyframeEntry> {
+        if index.entries.is_empty() {
+            return None;
+        }
+        
+        // Handle edge cases
+        if timestamp <= 0.0 {
+            return index.entries.first().cloned();
+        }
+        
+        if timestamp >= index.total_duration {
+            return index.entries.last().cloned();
+        }
+        
+        // Binary search for the nearest keyframe at or before the timestamp
+        let mut left = 0;
+        let mut right = index.entries.len();
+        
+        while left < right {
+            let mid = left + (right - left) / 2;
+            
+            if index.entries[mid].timestamp <= timestamp {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        
+        // left is now the index of the first keyframe after timestamp
+        // We want the keyframe at or before timestamp
+        if left == 0 {
+            // All keyframes are after timestamp, return the first one
+            index.entries.first().cloned()
+        } else {
+            // Return the keyframe just before or at the timestamp
+            index.entries.get(left - 1).cloned()
+        }
     }
 
     fn adjust_audio_video_sync(&mut self, playback_rate: f64) -> SyncInfo {
@@ -395,5 +478,193 @@ impl DefaultPlaybackController {
             r if r <= 4.0 => base_offset * 0.7, // More compensation for higher speeds
             _ => 0.0, // No sync for very high speeds (audio may be dropped)
         }
+    }
+    
+    /// Seek to a specific time with automatic keyframe alignment for non-keyframe positions
+    pub async fn seek_with_alignment(&mut self, position: f64, index: &KeyframeIndex) -> Result<SeekResult, PlaybackError> {
+        let start_time = Instant::now();
+        
+        if position < 0.0 || position > index.total_duration {
+            return Err(PlaybackError::InvalidSeekPosition { position });
+        }
+        
+        // Find the nearest keyframe
+        let keyframe_entry = self.find_nearest_keyframe(position, index)
+            .ok_or(PlaybackError::KeyframeNotFound { timestamp: position })?;
+        
+        // Check if the requested position is exactly at a keyframe
+        let is_exact_keyframe = (keyframe_entry.timestamp - position).abs() < index.index_precision;
+        
+        let actual_time = if is_exact_keyframe {
+            // Use the exact keyframe position
+            keyframe_entry.timestamp
+        } else {
+            // For non-keyframe positions, align to the previous keyframe
+            // This ensures decode integrity while providing the closest possible position
+            keyframe_entry.timestamp
+        };
+        
+        // Clear buffers and update position
+        self.clear_buffers()?;
+        self.current_position = actual_time;
+        self.last_seek_position = Some(actual_time);
+        self.sync_offset = 0.0;
+        
+        // Calculate precision achieved
+        let precision_achieved = if is_exact_keyframe {
+            1.0 // Perfect precision for keyframe positions
+        } else {
+            // Calculate how close we got to the requested position
+            let distance = (position - actual_time).abs();
+            let max_distance = index.index_precision;
+            1.0 - (distance / max_distance).min(1.0)
+        };
+        
+        let execution_time = start_time.elapsed();
+        
+        Ok(SeekResult {
+            requested_time: position,
+            actual_time,
+            keyframe_offset: keyframe_entry.file_offset,
+            precision_achieved,
+            keyframe_used: keyframe_entry,
+            execution_time,
+        })
+    }
+    
+    /// Find the optimal keyframe for seeking based on the optimization strategy
+    pub fn find_optimal_keyframe(&self, timestamp: f64, index: &KeyframeIndex) -> Option<KeyframeEntry> {
+        match index.optimization_strategy {
+            crate::types::IndexOptimizationStrategy::Full => {
+                // Use the standard nearest keyframe search for full index
+                self.find_nearest_keyframe(timestamp, index)
+            },
+            crate::types::IndexOptimizationStrategy::Sparse => {
+                // For sparse index, find the nearest available keyframe
+                self.find_nearest_sparse_keyframe(timestamp, index)
+            },
+            crate::types::IndexOptimizationStrategy::Adaptive => {
+                // Use adaptive strategy based on current memory usage
+                if index.memory_usage > index.entries.len() * 64 { // Threshold for switching to sparse
+                    self.find_nearest_sparse_keyframe(timestamp, index)
+                } else {
+                    self.find_nearest_keyframe(timestamp, index)
+                }
+            },
+            crate::types::IndexOptimizationStrategy::Hierarchical => {
+                // Use hierarchical search for better performance on large indices
+                self.find_hierarchical_keyframe(timestamp, index)
+            },
+        }
+    }
+    
+    /// Find nearest keyframe in a sparse index
+    fn find_nearest_sparse_keyframe(&self, timestamp: f64, index: &KeyframeIndex) -> Option<KeyframeEntry> {
+        if index.entries.is_empty() {
+            return None;
+        }
+        
+        // For sparse indices, we may need to search more broadly
+        let mut best_entry = None;
+        let mut best_distance = f64::INFINITY;
+        
+        for entry in &index.entries {
+            let distance = (entry.timestamp - timestamp).abs();
+            if entry.timestamp <= timestamp && distance < best_distance {
+                best_distance = distance;
+                best_entry = Some(entry.clone());
+            }
+        }
+        
+        // If no keyframe found before timestamp, use the first one
+        best_entry.or_else(|| index.entries.first().cloned())
+    }
+    
+    /// Find keyframe using hierarchical search for large indices
+    fn find_hierarchical_keyframe(&self, timestamp: f64, index: &KeyframeIndex) -> Option<KeyframeEntry> {
+        if index.entries.is_empty() {
+            return None;
+        }
+        
+        // For hierarchical indices, we can use a more sophisticated search
+        // This is a simplified version - in practice, this would use the hierarchical structure
+        let chunk_size = (index.entries.len() / 10).max(1);
+        let mut candidate_chunks = Vec::new();
+        
+        // First, find candidate chunks
+        for (i, chunk) in index.entries.chunks(chunk_size).enumerate() {
+            if let (Some(first), Some(last)) = (chunk.first(), chunk.last()) {
+                if timestamp >= first.timestamp && timestamp <= last.timestamp {
+                    candidate_chunks.push(i);
+                }
+            }
+        }
+        
+        // If no chunk contains the timestamp, find the nearest chunk before it
+        if candidate_chunks.is_empty() {
+            for (i, chunk) in index.entries.chunks(chunk_size).enumerate() {
+                if let Some(last) = chunk.last() {
+                    if last.timestamp <= timestamp {
+                        candidate_chunks.push(i);
+                    }
+                }
+            }
+        }
+        
+        // Search within the best candidate chunk
+        if let Some(&chunk_index) = candidate_chunks.last() {
+            let start_idx = chunk_index * chunk_size;
+            let end_idx = ((chunk_index + 1) * chunk_size).min(index.entries.len());
+            
+            for i in (start_idx..end_idx).rev() {
+                if index.entries[i].timestamp <= timestamp {
+                    return Some(index.entries[i].clone());
+                }
+            }
+        }
+        
+        // Fallback to first entry
+        index.entries.first().cloned()
+    }
+    
+    /// Get detailed seek operation information
+    pub fn get_seek_info(&self) -> Option<(f64, f64)> {
+        self.last_seek_position.map(|pos| (pos, self.current_position))
+    }
+    
+    /// Validate keyframe index for seek operations
+    pub fn validate_keyframe_index(&self, index: &KeyframeIndex) -> Result<(), PlaybackError> {
+        if index.entries.is_empty() {
+            return Err(PlaybackError::InvalidKeyframeIndex { 
+                reason: "Keyframe index is empty".to_string() 
+            });
+        }
+        
+        // Check if entries are sorted by timestamp
+        for window in index.entries.windows(2) {
+            if window[0].timestamp > window[1].timestamp {
+                return Err(PlaybackError::InvalidKeyframeIndex { 
+                    reason: "Keyframe entries are not sorted by timestamp".to_string() 
+                });
+            }
+        }
+        
+        // Check if total duration is consistent
+        if let Some(last_entry) = index.entries.last() {
+            if last_entry.timestamp > index.total_duration {
+                return Err(PlaybackError::InvalidKeyframeIndex { 
+                    reason: "Last keyframe timestamp exceeds total duration".to_string() 
+                });
+            }
+        }
+        
+        // Check precision value
+        if index.index_precision <= 0.0 {
+            return Err(PlaybackError::InvalidKeyframeIndex { 
+                reason: "Index precision must be positive".to_string() 
+            });
+        }
+        
+        Ok(())
     }
 }

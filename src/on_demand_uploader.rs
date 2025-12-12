@@ -7,15 +7,17 @@ use uuid::Uuid;
 
 use crate::types::{
     VideoSegment, AudioSegment, ProtocolMessage, MessageType, 
-    QUICConnection, StreamType
+    QUICConnection, StreamType, KeyframeIndex, KeyframeEntry, FrameType, IndexOptimizationStrategy
 };
-use crate::errors::{TransportError, FileError, UploadManagerError};
+use crate::errors::{TransportError, FileError, UploadManagerError, TimelineError};
 use crate::file_reader::{FileStreamReader, DefaultFileStreamReader};
 use crate::segmenter::{VideoSegmenter, DefaultVideoSegmenter};
 use crate::separator::{AudioVideoSeparator, DefaultAudioVideoSeparator};
 use crate::transport::{QUICTransport, DefaultQUICTransport};
 use crate::controller::{PlaybackController, DefaultPlaybackController};
 use crate::monitor::{PerformanceMonitor, DefaultPerformanceMonitor};
+use crate::timeline_manager::{TimelineManager, CacheStats};
+use crate::ffmpeg_cli_parser::TimelineData;
 use crate::mock_server::{FileRequestPayload, PlaybackCommand};
 
 /// 按需上传管理器 - 等待平台请求后才开始上传
@@ -32,6 +34,8 @@ pub struct OnDemandUploader {
     controller: Arc<Mutex<DefaultPlaybackController>>,
     /// 性能监控器
     monitor: Arc<Mutex<DefaultPerformanceMonitor>>,
+    /// 时间轴管理器
+    timeline_manager: Arc<TimelineManager>,
     /// 活跃的上传会话
     active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
     /// 可用文件注册表
@@ -61,6 +65,9 @@ pub struct UploadSession {
     pub total_bytes_transmitted: u64,
     pub average_segment_time_ms: f64,
     pub peak_throughput_mbps: f64,
+    // 新增：关键帧索引和seek结果
+    pub keyframe_index: Option<crate::types::KeyframeIndex>,
+    pub last_seek_result: Option<crate::types::SeekResult>,
 }
 
 /// 上传状态
@@ -84,6 +91,10 @@ pub struct LocalFileInfo {
     pub format: String,
     pub available: bool,
     pub metadata: crate::types::VideoFileInfo,
+    /// 时间轴数据 (如果已生成)
+    pub timeline_data: Option<TimelineData>,
+    /// 时间轴文件路径
+    pub timeline_file_path: Option<PathBuf>,
 }
 
 /// 平台消息
@@ -119,6 +130,7 @@ impl OnDemandUploader {
             transport: Arc::new(DefaultQUICTransport::new()),
             controller: Arc::new(Mutex::new(DefaultPlaybackController::new())),
             monitor: Arc::new(Mutex::new(DefaultPerformanceMonitor::new())),
+            timeline_manager: Arc::new(TimelineManager::new()),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             file_registry: Arc::new(RwLock::new(HashMap::new())),
             control_receiver: None,
@@ -163,6 +175,35 @@ impl OnDemandUploader {
             .unwrap_or("unknown")
             .to_lowercase();
 
+        // 生成时间轴数据
+        info!("Generating timeline for video file: {:?}", file_path);
+        let timeline_data = match self.timeline_manager.get_timeline(&file_path).await {
+            Ok(timeline) => {
+                info!("Timeline generated successfully: {:.2}s duration, {} keyframes", 
+                      timeline.total_duration, timeline.keyframes.len());
+                Some(timeline)
+            }
+            Err(TimelineError::FFmpeg(crate::errors::FFmpegError::NotAvailable)) => {
+                warn!("FFmpeg not available, timeline generation skipped for: {:?}", file_path);
+                None
+            }
+            Err(e) => {
+                warn!("Failed to generate timeline for {:?}: {}", file_path, e);
+                None
+            }
+        };
+
+        // 获取时间轴文件路径
+        let timeline_file_path = if timeline_data.is_some() {
+            let mut timeline_path = file_path.clone();
+            timeline_path.set_extension("timeline");
+            Some(timeline_path)
+        } else {
+            None
+        };
+
+        let has_timeline = timeline_data.is_some();
+        
         let file_info = LocalFileInfo {
             file_size: std::fs::metadata(&file_path)
                 .map_err(|e| FileError::IoError { message: e.to_string() })?
@@ -172,18 +213,75 @@ impl OnDemandUploader {
             available: true,
             metadata,
             file_path: file_path.clone(),
+            timeline_data,
+            timeline_file_path,
         };
 
         let file_key = file_path.to_string_lossy().to_string();
         self.file_registry.write().await.insert(file_key.clone(), file_info);
         
         info!("Successfully registered file: {}", file_key);
+        if has_timeline {
+            info!("  - Timeline data: Available");
+        } else {
+            info!("  - Timeline data: Not available");
+        }
+        
         Ok(())
     }
 
     /// 获取可用文件列表
     pub async fn get_available_files(&self) -> Vec<String> {
         self.file_registry.read().await.keys().cloned().collect()
+    }
+
+    /// 获取文件的时间轴数据
+    pub async fn get_file_timeline(&self, file_path: &str) -> Option<TimelineData> {
+        let registry = self.file_registry.read().await;
+        registry.get(file_path)?.timeline_data.clone()
+    }
+
+    /// 获取文件详细信息
+    pub async fn get_file_info(&self, file_path: &str) -> Option<LocalFileInfo> {
+        let registry = self.file_registry.read().await;
+        registry.get(file_path).cloned()
+    }
+
+    /// 获取时间轴缓存统计信息
+    pub async fn get_timeline_cache_stats(&self) -> CacheStats {
+        self.timeline_manager.get_cache_stats().await
+    }
+
+    /// 预加载文件的时间轴 (后台任务)
+    pub async fn preload_timeline(&self, file_path: &str) -> Result<(), TimelineError> {
+        if let Some(file_info) = self.get_file_info(file_path).await {
+            self.timeline_manager.preload_timeline(&file_info.file_path).await?;
+        }
+        Ok(())
+    }
+
+    /// 重新生成文件的时间轴
+    pub async fn regenerate_timeline(&self, file_path: &str) -> Result<(), FileError> {
+        let file_path_buf = PathBuf::from(file_path);
+        
+        // 清除缓存
+        self.timeline_manager.invalidate_cache(&file_path_buf).await;
+        
+        // 重新生成
+        let timeline_data = self.timeline_manager.get_timeline(&file_path_buf).await
+            .map_err(|e| FileError::TimelineError(e))?;
+        
+        // 更新注册表
+        let mut registry = self.file_registry.write().await;
+        if let Some(file_info) = registry.get_mut(file_path) {
+            file_info.timeline_data = Some(timeline_data);
+            let mut timeline_path = file_path_buf.clone();
+            timeline_path.set_extension("timeline");
+            file_info.timeline_file_path = Some(timeline_path);
+        }
+        
+        info!("Timeline regenerated for: {}", file_path);
+        Ok(())
     }
 
     /// 启动消息处理
@@ -508,6 +606,9 @@ impl OnDemandUploader {
                         total_bytes_transmitted: 0,
                         average_segment_time_ms: 0.0,
                         peak_throughput_mbps: 0.0,
+                        // 初始化关键帧索引和seek结果
+                        keyframe_index: None,
+                        last_seek_result: None,
                     };
                     
                     active_sessions.write().await.insert(session_id, session);
@@ -542,14 +643,67 @@ impl OnDemandUploader {
                     match command {
                         PlaybackCommand::Seek { position } => {
                             session.status = UploadStatus::Seeking;
-                            session.current_position = position;
                             
                             let mut controller_guard = controller.lock().await;
-                            if let Err(e) = controller_guard.seek(position).await {
-                                error!("Seek error: {}", e);
-                                session.status = UploadStatus::Error(e.to_string());
+                            
+                            // 尝试使用精确seek功能（如果有关键帧索引）
+                            let seek_result = if let Some(ref keyframe_index) = session.keyframe_index {
+                                // 使用关键帧索引进行精确seek
+                                match controller_guard.seek_to_keyframe(position, keyframe_index).await {
+                                    Ok(result) => {
+                                        info!("Precise seek completed: requested={:.3}s, actual={:.3}s, precision={:.3}", 
+                                              result.requested_time, result.actual_time, result.precision_achieved);
+                                        let actual_time = result.actual_time;
+                                        session.current_position = actual_time;
+                                        session.last_seek_result = Some(result);
+                                        Ok(actual_time)
+                                    }
+                                    Err(e) => Err(e)
+                                }
                             } else {
-                                session.status = UploadStatus::Active;
+                                // 回退到基本seek功能
+                                match controller_guard.seek(position).await {
+                                    Ok(_) => {
+                                        session.current_position = position;
+                                        Ok(position)
+                                    }
+                                    Err(e) => Err(e)
+                                }
+                            };
+                            
+                            drop(controller_guard); // 释放controller锁
+                            
+                            match seek_result {
+                                Ok(actual_position) => {
+                                    session.status = UploadStatus::Active;
+                                    
+                                    // 重要：从新位置重新启动上传任务
+                                    info!("Restarting upload from new position: {:.3}s for session {}", actual_position, session_id);
+                                    
+                                    // 启动新的上传任务从seek位置开始
+                                    let file_path = session.file_path.clone();
+                                    let playback_rate = session.playback_rate;
+                                    
+                                    Self::start_upload_task(
+                                        session_id,
+                                        file_path,
+                                        Some(actual_position), // 从seek位置开始
+                                        playback_rate,
+                                        active_sessions.clone(),
+                                        file_registry.clone(),
+                                        file_reader.clone(),
+                                        segmenter.clone(),
+                                        separator.clone(),
+                                        transport.clone(),
+                                        controller.clone(),
+                                        monitor.clone(),
+                                        connection.clone(),
+                                    ).await?;
+                                }
+                                Err(e) => {
+                                    error!("Seek error: {}", e);
+                                    session.status = UploadStatus::Error(e.to_string());
+                                }
                             }
                         }
                         
@@ -709,11 +863,63 @@ impl OnDemandUploader {
         let mut file_handle = file_reader.open_file(&file_info.file_path).await
             .map_err(|e| UploadManagerError::FileError(e))?;
 
-        // 如果有seek位置，先定位
+        // 构建关键帧索引以支持精确seek
+        info!("Building keyframe index for precise seek operations...");
+        let keyframe_index = if let Some(ref timeline) = file_info.timeline_data {
+            // 如果有timeline数据，使用真实的关键帧信息构建索引
+            info!("Using timeline data to build precise keyframe index");
+            Some(Self::build_keyframe_index_from_timeline(timeline))
+        } else {
+            // 回退到文件扫描方式
+            match file_reader.build_keyframe_index(&mut file_handle).await {
+                Ok(index) => {
+                    info!("Keyframe index built successfully: {} keyframes, precision: {:.3}s", 
+                          index.entries.len(), index.index_precision);
+                    Some(index)
+                }
+                Err(e) => {
+                    warn!("Failed to build keyframe index: {}. Falling back to basic seek.", e);
+                    None
+                }
+            }
+        };
+
+        // 将关键帧索引存储到会话中
+        {
+            let mut sessions = active_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.keyframe_index = keyframe_index.clone();
+            }
+        }
+
+        // 如果有seek位置，使用精确seek功能
         if let Some(position) = seek_position {
             let mut controller_guard = controller.lock().await;
-            controller_guard.seek(position).await
-                .map_err(|e| UploadManagerError::PlaybackError(e))?;
+            
+            if let Some(ref index) = keyframe_index {
+                // 使用关键帧索引进行精确seek
+                match controller_guard.seek_to_keyframe(position, index).await {
+                    Ok(result) => {
+                        info!("Initial precise seek completed: requested={:.3}s, actual={:.3}s, precision={:.3}", 
+                              result.requested_time, result.actual_time, result.precision_achieved);
+                        
+                        // 更新会话中的实际位置和seek结果
+                        let mut sessions = active_sessions.write().await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.current_position = result.actual_time;
+                            session.last_seek_result = Some(result);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Precise seek failed: {}", e);
+                        return Err(UploadManagerError::PlaybackError(e));
+                    }
+                }
+            } else {
+                // 回退到基本seek
+                controller_guard.seek(position).await
+                    .map_err(|e| UploadManagerError::PlaybackError(e))?;
+            }
         }
 
         // 设置播放速率
@@ -763,6 +969,47 @@ impl OnDemandUploader {
     /// 获取会话详细信息
     pub async fn get_session_info(&self, session_id: Uuid) -> Option<UploadSession> {
         self.active_sessions.read().await.get(&session_id).cloned()
+    }
+
+    /// 从timeline数据构建关键帧索引
+    fn build_keyframe_index_from_timeline(timeline: &TimelineData) -> KeyframeIndex {
+        
+        let mut entries = Vec::new();
+        
+        // 将timeline中的关键帧转换为KeyframeEntry
+        for keyframe in &timeline.keyframes {
+            let entry = KeyframeEntry {
+                timestamp: keyframe.timestamp,
+                file_offset: keyframe.file_offset,
+                frame_size: keyframe.frame_size,
+                gop_size: 1, // 关键帧的GOP大小为1
+                frame_type: FrameType::I, // 关键帧都是I帧
+            };
+            entries.push(entry);
+        }
+        
+        // 计算索引精度（相邻关键帧的平均间隔）
+        let index_precision = if entries.len() > 1 {
+            timeline.total_duration / (entries.len() - 1) as f64
+        } else {
+            timeline.total_duration
+        };
+        
+        // 计算内存使用量
+        let memory_usage = std::mem::size_of::<KeyframeIndex>() + 
+                          entries.len() * std::mem::size_of::<KeyframeEntry>();
+        
+        info!("Built keyframe index from timeline: {} keyframes, precision: {:.3}s", 
+              entries.len(), index_precision);
+        
+        KeyframeIndex {
+            entries,
+            total_duration: timeline.total_duration,
+            index_precision,
+            memory_optimized: true,
+            optimization_strategy: IndexOptimizationStrategy::Full,
+            memory_usage,
+        }
     }
 
     /// 模拟文件分片过程 - 优化为极低延迟
@@ -914,30 +1161,76 @@ impl OnDemandUploader {
         session_id: Uuid,
         file_info: &LocalFileInfo,
         _file_handle: tokio::fs::File,
-        _seek_position: Option<f64>,
+        seek_position: Option<f64>,
         _playback_rate: f64,
         active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
         _file_reader: Arc<DefaultFileStreamReader>,
         transport: Arc<DefaultQUICTransport>,
         mut connection: QUICConnection,
     ) -> Result<(), UploadManagerError> {
-        info!("Starting intelligent file transmission for session {} with format: {}", session_id, file_info.format);
+        let start_position = seek_position.unwrap_or(0.0);
         
-        // 读取整个文件内容
-        let file_data = std::fs::read(&file_info.file_path)
-            .map_err(|e| UploadManagerError::FileError(
-                crate::errors::FileError::IoError { message: e.to_string() }
-            ))?;
+        // 获取关键帧的file_offset（如果有seek位置）
+        let start_file_offset = if let Some(position) = seek_position {
+            // 从会话中获取最后的seek结果
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                if let Some(ref seek_result) = session.last_seek_result {
+                    info!("Using keyframe file offset: {} for position {:.3}s", 
+                          seek_result.keyframe_offset, position);
+                    Some(seek_result.keyframe_offset)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         
-        info!("Read {} bytes from file: {:?}", file_data.len(), file_info.file_path);
+        info!("Starting intelligent file transmission for session {} with format: {} from position: {:.3}s", 
+              session_id, file_info.format, start_position);
+        
+        // 读取文件内容（从指定偏移开始，如果有的话）
+        let file_data = if let Some(offset) = start_file_offset {
+            info!("Reading file from offset: {} bytes", offset);
+            let mut file = std::fs::File::open(&file_info.file_path)
+                .map_err(|e| UploadManagerError::FileError(
+                    crate::errors::FileError::IoError { message: e.to_string() }
+                ))?;
+            
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| UploadManagerError::FileError(
+                    crate::errors::FileError::IoError { message: e.to_string() }
+                ))?;
+            
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .map_err(|e| UploadManagerError::FileError(
+                    crate::errors::FileError::IoError { message: e.to_string() }
+                ))?;
+            buffer
+        } else {
+            // 读取整个文件
+            std::fs::read(&file_info.file_path)
+                .map_err(|e| UploadManagerError::FileError(
+                    crate::errors::FileError::IoError { message: e.to_string() }
+                ))?
+        };
+        
+        info!("Read {} bytes from file: {:?} (offset: {:?})", 
+              file_data.len(), file_info.file_path, start_file_offset);
         
         // 根据文件格式选择最优处理策略
         match file_info.format.as_str() {
             "h264" => {
                 info!("Processing H.264 file with frame-level segmentation (low latency mode)");
-                Self::process_h264_file(
+                Self::process_h264_file_from_position(
                     session_id,
                     &file_data,
+                    start_position,
                     active_sessions,
                     transport,
                     connection,
@@ -945,9 +1238,10 @@ impl OnDemandUploader {
             }
             "mp4" => {
                 info!("Processing MP4 file with fixed-size segmentation (high throughput mode)");
-                Self::process_mp4_file(
+                Self::process_mp4_file_from_position(
                     session_id,
                     &file_data,
+                    start_position,
                     active_sessions,
                     transport,
                     connection,
@@ -955,9 +1249,10 @@ impl OnDemandUploader {
             }
             _ => {
                 warn!("Unknown format {}, falling back to generic segmentation", file_info.format);
-                Self::process_generic_file(
+                Self::process_generic_file_from_position(
                     session_id,
                     &file_data,
+                    start_position,
                     active_sessions,
                     transport,
                     connection,
@@ -972,9 +1267,21 @@ impl OnDemandUploader {
         file_data: &[u8],
         active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
         transport: Arc<DefaultQUICTransport>,
+        connection: QUICConnection,
+    ) -> Result<(), UploadManagerError> {
+        Self::process_h264_file_from_position(session_id, file_data, 0.0, active_sessions, transport, connection).await
+    }
+
+    /// 处理H.264文件 - 从指定位置开始的帧级分片
+    async fn process_h264_file_from_position(
+        session_id: Uuid,
+        file_data: &[u8],
+        start_position: f64,
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
         mut connection: QUICConnection,
     ) -> Result<(), UploadManagerError> {
-        info!("Starting H.264 frame-level processing for session {}", session_id);
+        info!("Starting H.264 frame-level processing for session {} from position {:.3}s", session_id, start_position);
         
         // 创建视频分片器
         let segmenter = DefaultVideoSegmenter::with_frame_rate(30.0);
@@ -983,27 +1290,40 @@ impl OnDemandUploader {
         let frames = segmenter.parse_h264_frames(file_data);
         info!("Found {} H.264 frames in file", frames.len());
         
+        // 计算起始帧索引（基于30fps）
+        let start_frame_index = (start_position * 30.0) as usize;
+        let frames_to_transmit = if start_frame_index < frames.len() {
+            &frames[start_frame_index..]
+        } else {
+            info!("Start position {:.3}s is beyond file duration, starting from beginning", start_position);
+            &frames[..]
+        };
+        
+        info!("Starting transmission from frame {} (position {:.3}s), {} frames remaining", 
+              start_frame_index, start_position, frames_to_transmit.len());
+        
         // 记录传输开始时间并更新会话信息
         let transmission_start = std::time::Instant::now();
         {
             let mut sessions = active_sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
-                session.total_segments = frames.len() as u64;
+                session.total_segments = frames_to_transmit.len() as u64;
                 session.transmission_start_time = Some(transmission_start);
                 session.total_bytes_transmitted = 0;
             }
         }
         
-        // 逐帧传输
-        for (frame_index, (frame_pos, is_key_frame)) in frames.iter().enumerate() {
+        // 逐帧传输（从指定位置开始）
+        for (relative_index, (frame_pos, is_key_frame)) in frames_to_transmit.iter().enumerate() {
+            let actual_frame_index = start_frame_index + relative_index;
             // 检查会话状态
             if !Self::check_session_active(session_id, &active_sessions).await? {
                 return Ok(());
             }
             
             // 计算帧数据范围
-            let frame_end = if frame_index + 1 < frames.len() {
-                frames[frame_index + 1].0
+            let frame_end = if actual_frame_index + 1 < frames.len() {
+                frames[actual_frame_index + 1].0
             } else {
                 file_data.len()
             };
@@ -1013,16 +1333,16 @@ impl OnDemandUploader {
             // 提取编码参数
             let encoding_params = segmenter.extract_encoding_params(frame_data);
             
-            // 创建帧级视频分片
+            // 创建帧级视频分片（使用实际时间戳）
             let segment = crate::types::Segment::Video(crate::types::VideoSegment {
                 id: Uuid::new_v4(),
                 data: frame_data.to_vec(),
-                timestamp: frame_index as f64 / 30.0, // 30fps
+                timestamp: actual_frame_index as f64 / 30.0, // 使用实际帧索引计算时间戳
                 duration: 1.0 / 30.0, // 33.33ms per frame
                 frame_count: 1,
                 is_key_frame: *is_key_frame,
                 metadata: crate::types::SegmentMetadata {
-                    frame_indices: vec![frame_index],
+                    frame_indices: vec![actual_frame_index],
                     key_frame_positions: if *is_key_frame { vec![0] } else { vec![] },
                     encoding_params,
                 },
@@ -1039,7 +1359,7 @@ impl OnDemandUploader {
                     {
                         let mut sessions = active_sessions.write().await;
                         if let Some(session) = sessions.get_mut(&session_id) {
-                            session.uploaded_segments = (frame_index + 1) as u64;
+                            session.uploaded_segments = (relative_index + 1) as u64;
                             session.last_segment_time = Some(segment_end);
                             session.total_bytes_transmitted += frame_data.len() as u64;
                             
@@ -1064,20 +1384,21 @@ impl OnDemandUploader {
                         }
                     }
                     
-                    info!("Transmitted H.264 frame {}/{} ({} bytes, {}, {:.2}ms, {:.1}Mbps) for session {}", 
-                          frame_index + 1, frames.len(), frame_data.len(),
+                    info!("Transmitted H.264 frame {}/{} (actual frame {}, {:.3}s, {} bytes, {}, {:.2}ms, {:.1}Mbps) for session {}", 
+                          relative_index + 1, frames_to_transmit.len(), actual_frame_index + 1, 
+                          actual_frame_index as f64 / 30.0, frame_data.len(),
                           if *is_key_frame { "KEY" } else { "P/B" },
                           segment_duration.as_millis(),
                           (frame_data.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0,
                           session_id);
                     
                     // 极低延迟模式：最大速度传输，仅在必要时让出CPU
-                    if frame_index % 10 == 0 {
+                    if relative_index % 10 == 0 {
                         tokio::task::yield_now().await;
                     }
                 }
                 Err(e) => {
-                    error!("Failed to send H.264 frame {}: {}", frame_index + 1, e);
+                    error!("Failed to send H.264 frame {} (actual frame {}): {}", relative_index + 1, actual_frame_index + 1, e);
                     Self::mark_session_error(session_id, &active_sessions, e.to_string()).await;
                     return Err(UploadManagerError::TransportError(e));
                 }
@@ -1116,13 +1437,29 @@ impl OnDemandUploader {
         file_data: &[u8],
         active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
         transport: Arc<DefaultQUICTransport>,
+        connection: QUICConnection,
+    ) -> Result<(), UploadManagerError> {
+        Self::process_mp4_file_from_position(session_id, file_data, 0.0, active_sessions, transport, connection).await
+    }
+
+    /// 处理MP4文件 - 从指定位置开始的固定大小分片
+    async fn process_mp4_file_from_position(
+        session_id: Uuid,
+        file_data: &[u8],
+        start_position: f64,
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
         mut connection: QUICConnection,
     ) -> Result<(), UploadManagerError> {
-        info!("Starting MP4 file processing with fixed-size segmentation for session {}", session_id);
+        info!("Starting MP4 file processing with fixed-size segmentation for session {} from position {:.3}s", session_id, start_position);
         
         // MP4文件使用固定大小分片，避免复杂的音视频分离导致的问题
         let segment_size = 256 * 1024; // 256KB per segment - 更小的分片避免stream too long
         let total_segments = (file_data.len() + segment_size - 1) / segment_size;
+        
+        // 注意：file_data已经是从关键帧file_offset开始的数据，所以直接从0开始分片
+        info!("Starting transmission from segment 0 (position {:.3}s), {} segments remaining", 
+              start_position, total_segments);
         
         // 记录传输开始时间并更新会话信息
         let transmission_start = std::time::Instant::now();
@@ -1138,29 +1475,33 @@ impl OnDemandUploader {
         info!("MP4 file will be transmitted in {} segments of {}KB each (optimized for reliability)", 
               total_segments, segment_size / 1024);
         
-        // 分片传输MP4文件数据
-        for (segment_num, chunk) in file_data.chunks(segment_size).enumerate() {
+        // 直接分片传输文件数据（数据已经从正确的关键帧偏移开始）
+        let remaining_data = file_data;
+        
+        for (segment_num, chunk) in remaining_data.chunks(segment_size).enumerate() {
             if !Self::check_session_active(session_id, &active_sessions).await? {
                 return Ok(());
             }
             
-            // 创建MP4视频分片
+            // 创建MP4视频分片（从关键帧位置开始的时间戳）
+            let segment_timestamp = start_position + (segment_num as f64 * 0.5); // 每个分片约0.5秒
             let segment = crate::types::Segment::Video(crate::types::VideoSegment {
                 id: Uuid::new_v4(),
                 data: chunk.to_vec(),
-                timestamp: segment_num as f64 * 0.1, // 100ms per segment for MP4
-                duration: 0.1, // 100ms duration
+                timestamp: segment_timestamp,
+                duration: 0.5, // 500ms duration per segment
                 frame_count: 1,
-                is_key_frame: segment_num % 10 == 0, // 每10个分片一个关键帧标记
+                is_key_frame: segment_num == 0, // 第一个分片是关键帧
                 metadata: crate::types::SegmentMetadata {
                     frame_indices: vec![segment_num],
-                    key_frame_positions: if segment_num % 10 == 0 { vec![0] } else { vec![] },
+                    key_frame_positions: if segment_num == 0 { vec![0] } else { vec![] },
                     encoding_params: {
                         let mut params = std::collections::HashMap::new();
                         params.insert("container".to_string(), "mp4".to_string());
                         params.insert("segment_size".to_string(), chunk.len().to_string());
-                        params.insert("segment_mode".to_string(), "fixed_size".to_string());
-                        params.insert("optimized_for".to_string(), "reliability".to_string());
+                        params.insert("segment_mode".to_string(), "keyframe_aligned".to_string());
+                        params.insert("start_position".to_string(), start_position.to_string());
+                        params.insert("optimized_for".to_string(), "seek_accuracy".to_string());
                         params
                     },
                 },
@@ -1202,8 +1543,9 @@ impl OnDemandUploader {
                         }
                     }
                     
-                    info!("Transmitted MP4 segment {}/{} ({} bytes, {:.2}ms, {:.1}Mbps) for session {}", 
-                          segment_num + 1, total_segments, chunk.len(),
+                    info!("Transmitted MP4 segment {}/{} (segment {}, {:.3}s, {} bytes, {}ms, {:.1}Mbps) for session {}", 
+                          segment_num + 1, total_segments, segment_num + 1,
+                          segment_timestamp, chunk.len(),
                           segment_duration.as_millis(),
                           (chunk.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0,
                           session_id);
@@ -1253,44 +1595,76 @@ impl OnDemandUploader {
         file_data: &[u8],
         active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
         transport: Arc<DefaultQUICTransport>,
+        connection: QUICConnection,
+    ) -> Result<(), UploadManagerError> {
+        Self::process_generic_file_from_position(session_id, file_data, 0.0, active_sessions, transport, connection).await
+    }
+
+    /// 处理通用文件 - 从指定位置开始的简单分片
+    async fn process_generic_file_from_position(
+        session_id: Uuid,
+        file_data: &[u8],
+        start_position: f64,
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
         mut connection: QUICConnection,
     ) -> Result<(), UploadManagerError> {
-        info!("Starting generic file processing for session {}", session_id);
+        info!("Starting generic file processing for session {} from position {:.3}s", session_id, start_position);
         
         // 使用较小分片避免QUIC流限制
         let segment_size = 512 * 1024; // 512KB per segment
         let total_segments = (file_data.len() + segment_size - 1) / segment_size;
+        
+        // 计算起始分片索引（基于33ms每分片）
+        let start_segment_index = (start_position / 0.033) as usize;
+        let segments_to_transmit = if start_segment_index < total_segments {
+            total_segments - start_segment_index
+        } else {
+            info!("Start position {:.3}s is beyond file duration, starting from beginning", start_position);
+            total_segments
+        };
+        
+        info!("Starting transmission from segment {} (position {:.3}s), {} segments remaining", 
+              start_segment_index, start_position, segments_to_transmit);
         
         // 记录传输开始时间并更新会话信息
         let transmission_start = std::time::Instant::now();
         {
             let mut sessions = active_sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
-                session.total_segments = total_segments as u64;
+                session.total_segments = segments_to_transmit as u64;
                 session.transmission_start_time = Some(transmission_start);
                 session.total_bytes_transmitted = 0;
             }
         }
         
-        info!("File will be transmitted in {} segments of {}KB each", total_segments, segment_size / 1024);
+        info!("File will be transmitted in {} segments of {}KB each", segments_to_transmit, segment_size / 1024);
         
-        // 分片传输文件数据
-        for (segment_num, chunk) in file_data.chunks(segment_size).enumerate() {
+        // 分片传输文件数据（从指定位置开始）
+        let start_byte_offset = start_segment_index * segment_size;
+        let remaining_data = if start_byte_offset < file_data.len() {
+            &file_data[start_byte_offset..]
+        } else {
+            file_data
+        };
+        
+        for (relative_segment_num, chunk) in remaining_data.chunks(segment_size).enumerate() {
+            let actual_segment_num = start_segment_index + relative_segment_num;
             if !Self::check_session_active(session_id, &active_sessions).await? {
                 return Ok(());
             }
             
-            // 创建通用视频分片
+            // 创建通用视频分片（使用实际时间戳）
             let segment = crate::types::Segment::Video(crate::types::VideoSegment {
                 id: Uuid::new_v4(),
                 data: chunk.to_vec(),
-                timestamp: segment_num as f64 * 0.033,
+                timestamp: actual_segment_num as f64 * 0.033, // 使用实际分片索引计算时间戳
                 duration: 0.033,
                 frame_count: 1,
-                is_key_frame: segment_num % 30 == 0,
+                is_key_frame: actual_segment_num % 30 == 0,
                 metadata: crate::types::SegmentMetadata {
-                    frame_indices: vec![0],
-                    key_frame_positions: if segment_num % 30 == 0 { vec![0] } else { vec![] },
+                    frame_indices: vec![actual_segment_num],
+                    key_frame_positions: if actual_segment_num % 30 == 0 { vec![0] } else { vec![] },
                     encoding_params: {
                         let mut params = std::collections::HashMap::new();
                         params.insert("generic_data".to_string(), "true".to_string());
@@ -1311,7 +1685,7 @@ impl OnDemandUploader {
                     {
                         let mut sessions = active_sessions.write().await;
                         if let Some(session) = sessions.get_mut(&session_id) {
-                            session.uploaded_segments = (segment_num + 1) as u64;
+                            session.uploaded_segments = (relative_segment_num + 1) as u64;
                             session.last_segment_time = Some(segment_end);
                             session.total_bytes_transmitted += chunk.len() as u64;
                             
@@ -1336,19 +1710,20 @@ impl OnDemandUploader {
                         }
                     }
                     
-                    info!("Transmitted generic segment {}/{} ({} bytes, {:.2}ms, {:.1}Mbps) for session {}", 
-                          segment_num + 1, total_segments, chunk.len(),
+                    info!("Transmitted generic segment {}/{} (actual segment {}, {:.3}s, {} bytes, {:.2}ms, {:.1}Mbps) for session {}", 
+                          relative_segment_num + 1, segments_to_transmit, actual_segment_num + 1,
+                          actual_segment_num as f64 * 0.033, chunk.len(),
                           segment_duration.as_millis(),
                           (chunk.len() as f64 * 8.0) / (segment_duration.as_millis() as f64 / 1000.0) / 1_000_000.0,
                           session_id);
                     
                     // 极低延迟模式：最大速度传输，仅在必要时让出CPU
-                    if segment_num % 100 == 0 {
+                    if relative_segment_num % 100 == 0 {
                         tokio::task::yield_now().await;
                     }
                 }
                 Err(e) => {
-                    error!("Failed to send generic segment {}: {}", segment_num + 1, e);
+                    error!("Failed to send generic segment {} (actual segment {}): {}", relative_segment_num + 1, actual_segment_num + 1, e);
                     Self::mark_session_error(session_id, &active_sessions, e.to_string()).await;
                     return Err(UploadManagerError::TransportError(e));
                 }

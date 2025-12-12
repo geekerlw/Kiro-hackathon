@@ -159,8 +159,53 @@ Error Code | Name                    | Action
 
 ## Components and Interfaces
 
+### FFmpeg Parser
+负责使用FFmpeg命令行工具解析视频文件，生成关键帧时间轴数据。
+
+**接口定义：**
+```rust
+use std::path::Path;
+use std::process::Command;
+use serde::{Deserialize, Serialize};
+
+pub trait FFmpegParser {
+    async fn check_ffmpeg_availability(&self) -> Result<FFmpegInfo, FFmpegError>;
+    async fn parse_video_file(&self, file_path: &Path) -> Result<TimelineData, FFmpegError>;
+    async fn generate_timeline_file(&self, file_path: &Path, timeline_data: &TimelineData) -> Result<(), FFmpegError>;
+    async fn load_timeline_file(&self, file_path: &Path) -> Result<TimelineData, FFmpegError>;
+    fn is_timeline_file_valid(&self, video_path: &Path, timeline_path: &Path) -> bool;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineData {
+    pub video_file_path: String,
+    pub video_file_size: u64,
+    pub video_file_checksum: String,
+    pub total_duration: f64,
+    pub keyframes: Vec<KeyframeInfo>,
+    pub generated_at: String,
+    pub ffmpeg_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyframeInfo {
+    pub timestamp: f64,        // 时间戳（秒）
+    pub file_offset: u64,      // 文件偏移位置（字节）
+    pub frame_size: u32,       // 关键帧大小（字节）
+    pub pts: i64,              // 显示时间戳
+    pub dts: i64,              // 解码时间戳
+}
+
+#[derive(Debug, Clone)]
+pub struct FFmpegInfo {
+    pub version: String,
+    pub available: bool,
+    pub supported_formats: Vec<String>,
+}
+```
+
 ### File Stream Reader
-负责视频文件的流式读取和格式验证。
+负责视频文件的流式读取、格式验证和基于时间轴文件的精确seek操作。
 
 **接口定义：**
 ```rust
@@ -172,7 +217,25 @@ pub trait FileStreamReader {
     async fn read_chunk(&self, handle: &mut File, size: usize) -> Result<Vec<u8>, FileError>;
     async fn get_file_info(&self, handle: &mut File) -> Result<VideoFileInfo, FileError>;
     async fn seek_to_position(&self, handle: &mut File, position: u64) -> Result<(), FileError>;
+    async fn seek_to_time(&self, handle: &mut File, time_seconds: f64, timeline: &TimelineData) -> Result<u64, FileError>;
+    async fn load_or_generate_timeline(&self, file_path: &Path) -> Result<TimelineData, FileError>;
     async fn close_file(&self, handle: File) -> Result<(), FileError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyframeIndex {
+    pub entries: Vec<KeyframeEntry>,
+    pub total_duration: f64,
+    pub index_precision: f64, // 索引精度，支持亚秒级
+    pub memory_optimized: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyframeEntry {
+    pub timestamp: f64,        // 时间戳（秒）
+    pub file_offset: u64,      // 文件偏移位置
+    pub frame_size: u32,       // 关键帧大小
+    pub gop_size: u32,         // GOP大小
 }
 
 #[derive(Debug, Clone)]
@@ -344,12 +407,13 @@ pub struct ConnectionStats {
 ```
 
 ### Playback Controller
-处理SEEK和倍速控制功能。
+处理精确SEEK和倍速控制功能。
 
 **接口定义：**
 ```rust
 pub trait PlaybackController {
-    async fn seek(&mut self, position: f64) -> Result<(), PlaybackError>;
+    async fn seek(&mut self, position: f64) -> Result<SeekResult, PlaybackError>;
+    async fn seek_to_keyframe(&mut self, position: f64, index: &KeyframeIndex) -> Result<SeekResult, PlaybackError>;
     async fn set_playback_rate(&mut self, rate: f64) -> Result<(), PlaybackError>;
     fn get_drop_frame_strategy(&self, rate: f64) -> DropFrameStrategy;
     fn adjust_transmission_queue(
@@ -357,6 +421,15 @@ pub trait PlaybackController {
         segments: Vec<VideoSegment>,
         playback_rate: f64,
     ) -> Vec<VideoSegment>;
+    fn find_nearest_keyframe(&self, timestamp: f64, index: &KeyframeIndex) -> Option<KeyframeEntry>;
+}
+
+#[derive(Debug, Clone)]
+pub struct SeekResult {
+    pub requested_time: f64,
+    pub actual_time: f64,
+    pub keyframe_offset: u64,
+    pub precision_achieved: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -420,8 +493,68 @@ pub struct VideoMetadata {
     pub frame_rate: f64,
     pub bit_rate: u64,
     pub audio_tracks: Vec<AudioTrackInfo>,
+    pub keyframe_index: Option<KeyframeIndex>,
     pub created_at: SystemTime,
     pub checksum: String,
+}
+
+// 时间轴文件管理
+#[derive(Debug, Clone)]
+pub struct TimelineManager {
+    pub cached_timelines: HashMap<PathBuf, TimelineData>,
+    pub cache_limit: usize,
+    pub current_cache_size: usize,
+    pub ffmpeg_parser: Box<dyn FFmpegParser>,
+}
+
+impl TimelineManager {
+    pub async fn get_timeline(&mut self, video_path: &Path) -> Result<TimelineData, TimelineError> {
+        // 检查缓存
+        if let Some(timeline) = self.cached_timelines.get(video_path) {
+            return Ok(timeline.clone());
+        }
+        
+        // 检查时间轴文件是否存在且有效
+        let timeline_path = self.get_timeline_file_path(video_path);
+        if timeline_path.exists() && self.ffmpeg_parser.is_timeline_file_valid(video_path, &timeline_path) {
+            let timeline = self.ffmpeg_parser.load_timeline_file(&timeline_path).await?;
+            self.cached_timelines.insert(video_path.to_path_buf(), timeline.clone());
+            return Ok(timeline);
+        }
+        
+        // 生成新的时间轴文件
+        let timeline = self.ffmpeg_parser.parse_video_file(video_path).await?;
+        self.ffmpeg_parser.generate_timeline_file(video_path, &timeline).await?;
+        self.cached_timelines.insert(video_path.to_path_buf(), timeline.clone());
+        Ok(timeline)
+    }
+    
+    fn get_timeline_file_path(&self, video_path: &Path) -> PathBuf {
+        let mut timeline_path = video_path.to_path_buf();
+        timeline_path.set_extension("timeline");
+        timeline_path
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum IndexOptimizationStrategy {
+    Full,           // 完整索引，所有关键帧
+    Sparse,         // 稀疏索引，定期采样
+    Adaptive,       // 自适应，根据内存动态调整
+    Hierarchical,   // 分层索引，多级精度
+}
+
+// Seek操作结果
+#[derive(Debug, Clone)]
+pub struct SeekOperation {
+    pub id: Uuid,
+    pub requested_time: f64,
+    pub actual_time: f64,
+    pub target_offset: u64,
+    pub keyframe_used: KeyframeEntry,
+    pub seek_accuracy: f64,
+    pub execution_time: Duration,
+    pub timestamp: SystemTime,
 }
 
 // 分辨率信息
@@ -719,6 +852,66 @@ pub struct BufferHealth {
 **Property 36: Resource adaptation**
 *For any* insufficient system resources condition, the system should adjust processing parameters to adapt to available resources
 **Validates: Requirements 7.5**
+
+### FFmpeg Integration Properties
+
+**Property 37: FFmpeg availability detection**
+*For any* system startup, the system should correctly detect whether FFmpeg command-line tool is available
+**Validates: Requirements 8.1**
+
+**Property 38: FFmpeg unavailability handling**
+*For any* system where FFmpeg is not available, the system should display appropriate error messages and installation guidance
+**Validates: Requirements 8.2**
+
+**Property 39: Video file parsing with FFmpeg**
+*For any* video file parsing request, the system should use FFmpeg commands to extract keyframe timestamps and file offset information
+**Validates: Requirements 8.3**
+
+**Property 40: Parsing progress display**
+*For any* ongoing FFmpeg parsing process, the system should display parsing progress and allow user cancellation
+**Validates: Requirements 8.4**
+
+**Property 41: Timeline file serialization**
+*For any* completed FFmpeg parsing, the system should serialize the results into a JSON format timeline file
+**Validates: Requirements 8.5**
+
+**Property 42: FFmpeg parsing error handling**
+*For any* FFmpeg parsing failure, the system should log error information and provide fallback basic seek functionality
+**Validates: Requirements 8.6**
+
+**Property 43: Timeline file corruption detection**
+*For any* corrupted timeline file format, the system should detect format errors and regenerate the timeline file
+**Validates: Requirements 8.7**
+
+### File Seek Operation Properties
+
+**Property 44: FFmpeg-based timeline generation**
+*For any* video file being loaded, the system should use FFmpeg command-line tool to parse keyframe information and generate timeline data
+**Validates: Requirements 9.1**
+
+**Property 45: Timeline file creation**
+*For any* completed FFmpeg parsing, the system should generate a timeline file containing keyframe timestamps and file offset positions
+**Validates: Requirements 9.2**
+
+**Property 46: Timeline file naming consistency**
+*For any* generated timeline file, it should be saved with the same name as the original video file but with a timeline extension
+**Validates: Requirements 9.3**
+
+**Property 47: Timeline-based seek accuracy**
+*For any* seek request with second-based time input, the playback controller should locate the nearest keyframe position from the timeline file
+**Validates: Requirements 9.4**
+
+**Property 48: Direct file offset seeking**
+*For any* seek operation, the file stream reader should jump directly to the timeline file specified file offset position for data reading
+**Validates: Requirements 9.5**
+
+**Property 49: Non-keyframe seek alignment**
+*For any* seek request to a non-keyframe timestamp, the playback controller should automatically locate the previous nearest keyframe to ensure decode integrity
+**Validates: Requirements 9.6**
+
+**Property 50: Timeline file caching**
+*For any* existing timeline file where the video file is unchanged, the system should directly load the existing timeline file without re-parsing
+**Validates: Requirements 9.7**
 
 ## Error Handling
 

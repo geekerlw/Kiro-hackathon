@@ -1,0 +1,94 @@
+{
+  "video_file_path": "test_videos/sample1.mp4",
+  "video_file_size": 8502716,
+  "video_file_checksum": "8502716_1765419257",
+  "total_duration": 60.03,
+  "keyframes": [
+    {
+      "timestamp": 0.0,
+      "file_offset": 22504,
+      "frame_size": 71276,
+      "pts": 0,
+      "dts": 0
+    },
+    {
+      "timestamp": 5.005,
+      "file_offset": 1121760,
+      "frame_size": 62990,
+      "pts": 150,
+      "dts": 150
+    },
+    {
+      "timestamp": 10.01,
+      "file_offset": 2329661,
+      "frame_size": 66380,
+      "pts": 300,
+      "dts": 300
+    },
+    {
+      "timestamp": 15.015,
+      "file_offset": 3159344,
+      "frame_size": 150018,
+      "pts": 450,
+      "dts": 450
+    },
+    {
+      "timestamp": 20.02,
+      "file_offset": 3545037,
+      "frame_size": 195024,
+      "pts": 600,
+      "dts": 600
+    },
+    {
+      "timestamp": 25.025,
+      "file_offset": 3922722,
+      "frame_size": 184533,
+      "pts": 750,
+      "dts": 750
+    },
+    {
+      "timestamp": 30.03,
+      "file_offset": 4291914,
+      "frame_size": 185763,
+      "pts": 900,
+      "dts": 900
+    },
+    {
+      "timestamp": 35.035,
+      "file_offset": 4696591,
+      "frame_size": 166675,
+      "pts": 1051,
+      "dts": 1051
+    },
+    {
+      "timestamp": 40.04,
+      "file_offset": 5112604,
+      "frame_size": 196593,
+      "pts": 1201,
+      "dts": 1201
+    },
+    {
+      "timestamp": 45.045,
+      "file_offset": 5458308,
+      "frame_size": 198019,
+      "pts": 1351,
+      "dts": 1351
+    },
+    {
+      "timestamp": 50.05,
+      "file_offset": 5858752,
+      "frame_size": 95556,
+      "pts": 1501,
+      "dts": 1501
+    },
+    {
+      "timestamp": 55.055,
+      "file_offset": 6864411,
+      "frame_size": 73202,
+      "pts": 1651,
+      "dts": 1651
+    }
+  ],
+  "generated_at": "2025-12-12T01:53:26.750302+00:00",
+  "ffmpeg_version": "ffmpeg version 8.0.1 Copyright (c) 2000-2025 the FFmpeg developers"
+}

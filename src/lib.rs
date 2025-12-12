@@ -1,4 +1,6 @@
 pub mod file_reader;
+pub mod ffmpeg_cli_parser;
+pub mod timeline_manager;
 pub mod segmenter;
 pub mod separator;
 pub mod transport;
@@ -14,6 +16,8 @@ pub mod network_error_handler;
 pub mod resource_monitor;
 #[cfg(test)]
 mod error_handling_integration_test;
+#[cfg(test)]
+mod seek_integration_test;
 pub mod upload_manager;
 pub mod config;
 pub mod app;

@@ -34,6 +34,30 @@
     - **Property 4: Error detection reliability**
     - **Validates: Requirements 1.5, 1.6**
 
+  - [x] 2.5 实现关键帧索引构建功能
+    - 编写关键帧检测和索引构建算法
+    - 实现KeyframeIndex和KeyframeEntry数据结构
+    - 添加内存优化策略支持（稀疏索引、分层索引等）
+    - 支持亚秒级精度的时间戳映射
+    - _Requirements: 9.1, 9.4, 9.6_
+
+  - [x]* 2.6 编写关键帧索引的属性测试
+    - **Property 37: Keyframe index construction**
+    - **Property 40: Sub-second precision support**
+    - **Property 42: Memory optimization for large indices**
+    - **Validates: Requirements 9.1, 9.4, 9.6**
+
+  - [x] 2.7 实现时间基础的文件seek功能
+    - 编写seek_to_time方法，支持按秒为单位的定位
+    - 实现直接跳转到文件偏移位置的功能
+    - 添加seek操作的结果验证和精度测量
+    - _Requirements: 9.2, 9.3_
+
+  - [ ]* 2.8 编写文件seek的属性测试
+    - **Property 38: Time-based seek accuracy**
+    - **Property 39: Direct file offset seeking**
+    - **Validates: Requirements 9.2, 9.3**
+
 - [x] 3. 实现视频分片器
   - [x] 3.1 实现VideoSegmenter trait的核心功能
     - 编写帧级别分片算法，支持在关键帧位置分割
@@ -119,6 +143,11 @@
 - [x] 6. 检查点 - 确保核心传输功能正常
   - 确保所有测试通过，如有问题请询问用户
 
+- [x] 6.1 检查点 - 确保seek功能正常
+  - 确保关键帧索引构建和文件seek功能正常工作
+  - 验证时间精度和内存优化策略有效
+  - 确保所有seek相关测试通过，如有问题请询问用户
+
 - [x] 7. 实现播放控制器
   - [x] 7.1 实现PlaybackController trait的SEEK功能
     - 编写SEEK到特定时间点的算法
@@ -137,10 +166,22 @@
     - _Requirements: 5.2, 5.3, 5.5_
 
   - [ ]* 7.4 编写倍速控制的属性测试
-    - **Property 23: Playback rate adjustment**
+    - **Property 23: Playback rate rate adjustment**
     - **Property 24: Frame dropping strategy**
     - **Property 26: Synchronization adjustment**
     - **Validates: Requirements 5.2, 5.3, 5.5**
+
+  - [x] 7.5 实现精确seek和关键帧定位功能
+    - 编写seek_to_keyframe方法，使用关键帧索引进行精确定位
+    - 实现find_nearest_keyframe算法，自动定位到最近的关键帧
+    - 添加非关键帧时间点的自动对齐功能
+    - 实现SeekResult结构，提供详细的seek操作反馈
+    - _Requirements: 9.2, 9.5_
+
+  - [ ]* 7.6 编写精确seek的属性测试
+    - **Property 38: Time-based seek accuracy**
+    - **Property 41: Non-keyframe seek alignment**
+    - **Validates: Requirements 9.2, 9.5**
 
 - [x] 8. 实现性能监控器
   - [x] 8.1 实现PerformanceMonitor trait的基础功能
@@ -211,3 +252,66 @@
 
 - [x] 11. 最终检查点 - 确保所有测试通过
   - 确保所有测试通过，如有问题请询问用户
+
+- [ ] 12. 实现基于FFmpeg命令行的时间轴文件系统
+  - [ ] 12.1 创建FFmpeg命令行解析器
+    - 实现FFmpeg可用性检测和版本信息获取
+    - 编写FFmpeg命令执行和输出解析功能
+    - 添加解析进度显示和用户取消支持
+    - _Requirements: 8.1, 8.2, 8.4_
+
+  - [ ]* 12.2 编写FFmpeg解析器的属性测试
+    - **Property 37: FFmpeg availability detection**
+    - **Property 38: FFmpeg unavailability handling**
+    - **Property 40: Parsing progress display**
+    - **Validates: Requirements 8.1, 8.2, 8.4**
+
+  - [ ] 12.3 实现视频文件关键帧解析
+    - 使用FFmpeg命令提取关键帧时间戳和文件偏移信息
+    - 实现TimelineData和KeyframeInfo数据结构
+    - 添加解析错误处理和备用功能
+    - _Requirements: 8.3, 8.6, 9.1_
+
+  - [ ]* 12.4 编写关键帧解析的属性测试
+    - **Property 39: Video file parsing with FFmpeg**
+    - **Property 42: FFmpeg parsing error handling**
+    - **Property 44: FFmpeg-based timeline generation**
+    - **Validates: Requirements 8.3, 8.6, 9.1**
+
+  - [ ] 12.5 实现时间轴文件管理
+    - 编写时间轴文件的JSON序列化和反序列化
+    - 实现时间轴文件的生成、加载和验证
+    - 添加文件完整性检查和损坏检测
+    - _Requirements: 8.5, 8.7, 9.2, 9.3_
+
+  - [ ]* 12.6 编写时间轴文件的属性测试
+    - **Property 41: Timeline file serialization**
+    - **Property 43: Timeline file corruption detection**
+    - **Property 45: Timeline file creation**
+    - **Property 46: Timeline file naming consistency**
+    - **Validates: Requirements 8.5, 8.7, 9.2, 9.3**
+
+  - [ ] 12.7 实现基于时间轴的seek功能
+    - 更新FileStreamReader以使用时间轴文件进行seek
+    - 实现时间轴缓存和管理机制
+    - 添加时间轴文件的自动重用和更新检测
+    - _Requirements: 9.4, 9.5, 9.6, 9.7_
+
+  - [ ]* 12.8 编写时间轴seek的属性测试
+    - **Property 47: Timeline-based seek accuracy**
+    - **Property 48: Direct file offset seeking**
+    - **Property 49: Non-keyframe seek alignment**
+    - **Property 50: Timeline file caching**
+    - **Validates: Requirements 9.4, 9.5, 9.6, 9.7**
+
+  - [ ] 12.9 更新现有组件以使用时间轴系统
+    - 修改PlaybackController以使用时间轴数据进行seek
+    - 更新UploadManager以集成时间轴文件生成
+    - 添加时间轴系统的配置选项和用户界面
+    - _Requirements: 5.1, 5.4, 9.2, 9.5_
+
+  - [ ] 12.10 创建FFmpeg命令行集成示例和文档
+    - 提供FFmpeg安装和配置指南
+    - 展示时间轴文件生成和使用的示例代码
+    - 包含故障排除和性能优化建议
+    - _Requirements: 8.1, 8.2_

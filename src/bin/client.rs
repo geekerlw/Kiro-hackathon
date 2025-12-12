@@ -157,7 +157,10 @@ async fn start_interactive_console(uploader: OnDemandUploader) -> Result<(), Box
     info!("  status - Show client status");
     info!("  sessions - List active upload sessions");
     info!("  files - List registered files");
+    info!("  timeline <file_path> - Show timeline info for a file");
+    info!("  cache - Show timeline cache statistics");
     info!("  register <file_path> - Register a new file");
+    info!("  regenerate <file_path> - Regenerate timeline for a file");
     info!("  quit - Exit client");
     info!("");
 
@@ -211,21 +214,103 @@ async fn start_interactive_console(uploader: OnDemandUploader) -> Result<(), Box
                     info!("No files registered");
                 } else {
                     info!("Registered files:");
-                    for file in available_files {
-                        info!("  - {}", file);
+                    for file in &available_files {
+                        if let Some(file_info) = uploader.get_file_info(file).await {
+                            let timeline_status = if file_info.timeline_data.is_some() {
+                                "✅ Timeline available"
+                            } else {
+                                "❌ No timeline"
+                            };
+                            info!("  - {} ({:.2}s) - {}", 
+                                  file, 
+                                  file_info.duration.unwrap_or(0.0),
+                                  timeline_status);
+                        } else {
+                            info!("  - {}", file);
+                        }
                     }
                 }
+            }
+
+            "timeline" => {
+                if parts.len() >= 2 {
+                    let file_path = parts[1];
+                    if let Some(timeline) = uploader.get_file_timeline(file_path).await {
+                        info!("Timeline for: {}", file_path);
+                        info!("  Duration: {:.2} seconds", timeline.total_duration);
+                        info!("  Keyframes: {}", timeline.keyframes.len());
+                        info!("  Generated: {}", timeline.generated_at);
+                        info!("  FFmpeg version: {}", timeline.ffmpeg_version);
+                        
+                        if !timeline.keyframes.is_empty() {
+                            let avg_interval = timeline.total_duration / timeline.keyframes.len() as f64;
+                            info!("  Average keyframe interval: {:.2}s", avg_interval);
+                            
+                            info!("  First 5 keyframes:");
+                            for (i, keyframe) in timeline.keyframes.iter().take(5).enumerate() {
+                                info!("    {}. {:.2}s @ offset {} ({} bytes)", 
+                                      i + 1, keyframe.timestamp, keyframe.file_offset, keyframe.frame_size);
+                            }
+                            
+                            if timeline.keyframes.len() > 5 {
+                                info!("    ... and {} more keyframes", timeline.keyframes.len() - 5);
+                            }
+                        }
+                    } else {
+                        error!("No timeline data found for: {}", file_path);
+                    }
+                } else {
+                    info!("Usage: timeline <file_path>");
+                }
+            }
+
+            "cache" => {
+                let stats = uploader.get_timeline_cache_stats().await;
+                info!("Timeline Cache Statistics:");
+                info!("  Cached files: {}", stats.cached_files);
+                info!("  Cache size: {:.2} MB / {:.2} MB", 
+                      stats.cache_size_bytes as f64 / 1024.0 / 1024.0,
+                      stats.cache_limit_bytes as f64 / 1024.0 / 1024.0);
+                info!("  Cache usage: {:.1}%", stats.cache_usage_percent);
             }
 
             "register" => {
                 if parts.len() >= 2 {
                     let file_path = PathBuf::from(parts[1]);
+                    info!("Registering file: {:?}", file_path);
                     match uploader.register_local_file(file_path.clone()).await {
-                        Ok(_) => info!("Successfully registered file: {:?}", file_path),
+                        Ok(_) => {
+                            info!("Successfully registered file: {:?}", file_path);
+                            // 显示时间轴信息
+                            let file_key = file_path.to_string_lossy().to_string();
+                            if let Some(timeline) = uploader.get_file_timeline(&file_key).await {
+                                info!("  Timeline generated: {:.2}s duration, {} keyframes", 
+                                      timeline.total_duration, timeline.keyframes.len());
+                            }
+                        }
                         Err(e) => error!("Failed to register file {:?}: {}", file_path, e),
                     }
                 } else {
                     info!("Usage: register <file_path>");
+                }
+            }
+
+            "regenerate" => {
+                if parts.len() >= 2 {
+                    let file_path = parts[1];
+                    info!("Regenerating timeline for: {}", file_path);
+                    match uploader.regenerate_timeline(file_path).await {
+                        Ok(_) => {
+                            info!("Timeline regenerated successfully");
+                            if let Some(timeline) = uploader.get_file_timeline(file_path).await {
+                                info!("  New timeline: {:.2}s duration, {} keyframes", 
+                                      timeline.total_duration, timeline.keyframes.len());
+                            }
+                        }
+                        Err(e) => error!("Failed to regenerate timeline: {}", e),
+                    }
+                } else {
+                    info!("Usage: regenerate <file_path>");
                 }
             }
 

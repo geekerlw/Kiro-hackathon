@@ -23,6 +23,24 @@ pub enum FileError {
     
     #[error("IO error: {message}")]
     IoError { message: String },
+    
+    #[error("Invalid seek position")]
+    InvalidSeekPosition,
+    
+    #[error("Seek operation failed")]
+    SeekFailed,
+    
+    #[error("Seek position beyond end of file")]
+    SeekBeyondEnd,
+    
+    #[error("FFmpeg error: {0}")]
+    FFmpegError(#[from] FFmpegError),
+    
+    #[error("Timeline error: {0}")]
+    TimelineError(#[from] TimelineError),
+    
+    #[error("No video stream found in file")]
+    NoVideoStream,
 }
 
 #[derive(Error, Debug)]
@@ -137,6 +155,12 @@ pub enum PlaybackError {
     
     #[error("Synchronization lost")]
     SyncLost,
+    
+    #[error("Keyframe not found at timestamp: {timestamp}")]
+    KeyframeNotFound { timestamp: f64 },
+    
+    #[error("Invalid keyframe index: {reason}")]
+    InvalidKeyframeIndex { reason: String },
 }
 
 #[derive(Error, Debug)]
@@ -312,4 +336,75 @@ pub enum VideoStreamingError {
     
     #[error("System resource error: {message}")]
     SystemResource { message: String },
+    
+    #[error("FFmpeg error: {0}")]
+    FFmpeg(#[from] FFmpegError),
+    
+    #[error("Timeline error: {0}")]
+    Timeline(#[from] TimelineError),
+}
+
+// FFmpeg command line integration errors
+#[derive(Error, Debug)]
+pub enum FFmpegError {
+    #[error("FFmpeg not available on this system")]
+    NotAvailable,
+    
+    #[error("FFmpeg command failed: {0}")]
+    CommandFailed(String),
+    
+    #[error("Failed to parse FFmpeg output: {0}")]
+    ParseError(String),
+    
+    #[error("File operation error: {0}")]
+    FileError(String),
+    
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+    
+    #[error("Deserialization error: {0}")]
+    DeserializationError(String),
+    
+    #[error("Timeline file corrupted: {0}")]
+    TimelineCorrupted(String),
+    
+    #[error("Unsupported video format: {0}")]
+    UnsupportedFormat(String),
+    
+    #[error("FFmpeg version incompatible: {version}")]
+    IncompatibleVersion { version: String },
+    
+    #[error("Parsing cancelled by user")]
+    Cancelled,
+    
+    #[error("Parsing timeout after {duration:?}")]
+    Timeout { duration: std::time::Duration },
+}
+
+// Timeline file management errors
+#[derive(Error, Debug)]
+pub enum TimelineError {
+    #[error("Timeline file not found: {0}")]
+    NotFound(String),
+    
+    #[error("Timeline file corrupted: {0}")]
+    Corrupted(String),
+    
+    #[error("Timeline file outdated: video modified after timeline generation")]
+    Outdated,
+    
+    #[error("Timeline cache full: {current_size} MB used, {limit} MB limit")]
+    CacheFull { current_size: u64, limit: u64 },
+    
+    #[error("Timeline validation failed: {reason}")]
+    ValidationFailed { reason: String },
+    
+    #[error("FFmpeg error: {0}")]
+    FFmpeg(#[from] FFmpegError),
+    
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    
+    #[error("JSON serialization error: {0}")]
+    JsonSerialization(#[from] serde_json::Error),
 }

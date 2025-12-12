@@ -12,6 +12,10 @@
 - **Audio_Video_Separator**: 负责分离音频和视频流的组件
 - **Performance_Monitor**: 负责监控和统计上传性能的组件
 - **Playback_Controller**: 负责处理SEEK和倍速控制的组件
+- **File_Stream_Reader**: 负责文件流式读取和seek操作的组件
+- **Keyframe_Index**: 关键帧偏移位置与时间轴映射关系的数据结构
+- **Timeline_File**: 包含关键帧时间戳和文件偏移位置的JSON格式数据文件
+- **FFmpeg_Parser**: 使用FFmpeg命令行工具解析视频文件的组件
 - **Cloud_Server**: 接收视频流数据的远程服务器
 
 ## Requirements
@@ -79,6 +83,20 @@
 4. WHEN 执行SEEK操作 THEN Playback_Controller SHALL 清除当前传输缓冲区并重新排队相关片段
 5. WHEN 播放速度变化 THEN Playback_Controller SHALL 动态调整音视频同步策略
 
+### Requirement 9
+
+**User Story:** 作为用户，我希望系统能够支持精确的文件seek操作，以便快速跳转到视频的任意时间位置进行传输。
+
+#### Acceptance Criteria
+
+1. WHEN 加载视频文件 THEN Video_Streaming_Uploader SHALL 使用FFmpeg命令行工具解析视频文件的关键帧信息
+2. WHEN FFmpeg解析完成 THEN Video_Streaming_Uploader SHALL 生成包含关键帧时间戳和文件偏移位置的时间轴文件
+3. WHEN 时间轴文件生成 THEN Video_Streaming_Uploader SHALL 将时间轴文件保存为与原视频文件同名的timeline文件
+4. WHEN 用户请求按秒为单位的seek操作 THEN Playback_Controller SHALL 从时间轴文件中查找最近的关键帧位置
+5. WHEN 执行seek操作 THEN File_Stream_Reader SHALL 直接跳转到时间轴文件指定的文件偏移位置开始读取数据
+6. WHEN seek到非关键帧时间点 THEN Playbook_Controller SHALL 自动定位到前一个最近的关键帧位置以确保解码完整性
+7. WHEN 时间轴文件已存在且视频文件未修改 THEN Video_Streaming_Uploader SHALL 直接加载现有时间轴文件而不重新解析
+
 ### Requirement 6
 
 **User Story:** 作为用户，我希望能够实时监控上传速度和延迟统计，以便了解传输性能。
@@ -104,6 +122,20 @@
 5. WHEN 系统资源不足 THEN Video_Streaming_Uploader SHALL 调整处理参数以适应可用资源
 
 ### Requirement 8
+
+**User Story:** 作为用户，我希望系统能够使用FFmpeg命令行工具来解析视频文件，以便生成精确的关键帧时间轴数据。
+
+#### Acceptance Criteria
+
+1. WHEN 系统启动 THEN Video_Streaming_Uploader SHALL 检测系统中是否安装了FFmpeg命令行工具
+2. WHEN FFmpeg不可用 THEN Video_Streaming_Uploader SHALL 显示错误信息并提供安装指导
+3. WHEN 解析视频文件 THEN Video_Streaming_Uploader SHALL 使用FFmpeg命令提取关键帧的时间戳和文件偏移信息
+4. WHEN FFmpeg解析过程中 THEN Video_Streaming_Uploader SHALL 显示解析进度并允许用户取消操作
+5. WHEN FFmpeg解析完成 THEN Video_Streaming_Uploader SHALL 将解析结果序列化为JSON格式的时间轴文件
+6. WHEN FFmpeg解析失败 THEN Video_Streaming_Uploader SHALL 记录错误信息并提供备用的基础seek功能
+7. WHEN 时间轴文件格式损坏 THEN Video_Streaming_Uploader SHALL 检测格式错误并重新生成时间轴文件
+
+### Requirement 10
 
 **User Story:** 作为开发者，我希望系统具有清晰的架构分离，以便于维护和扩展功能。
 

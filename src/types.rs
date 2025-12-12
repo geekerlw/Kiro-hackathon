@@ -16,6 +16,74 @@ pub struct VideoFileInfo {
     pub has_audio: bool,
 }
 
+// Keyframe index structures for precise seek operations
+#[derive(Debug, Clone)]
+pub struct KeyframeIndex {
+    pub entries: Vec<KeyframeEntry>,
+    pub total_duration: f64,
+    pub index_precision: f64, // 索引精度，支持亚秒级
+    pub memory_optimized: bool,
+    pub optimization_strategy: IndexOptimizationStrategy,
+    pub memory_usage: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyframeEntry {
+    pub timestamp: f64,        // 时间戳（秒）
+    pub file_offset: u64,      // 文件偏移位置
+    pub frame_size: u32,       // 关键帧大小
+    pub gop_size: u32,         // GOP大小
+    pub frame_type: FrameType, // 帧类型
+}
+
+#[derive(Debug, Clone)]
+pub enum FrameType {
+    I,  // Intra frame (keyframe)
+    P,  // Predicted frame
+    B,  // Bidirectional frame
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IndexOptimizationStrategy {
+    Full,           // 完整索引，所有关键帧
+    Sparse,         // 稀疏索引，定期采样
+    Adaptive,       // 自适应，根据内存动态调整
+    Hierarchical,   // 分层索引，多级精度
+}
+
+// Keyframe index manager for memory optimization
+#[derive(Debug, Clone)]
+pub struct KeyframeIndexManager {
+    pub indices: HashMap<PathBuf, KeyframeIndex>,
+    pub memory_limit: usize,
+    pub current_memory_usage: usize,
+    pub optimization_strategy: IndexOptimizationStrategy,
+}
+
+// Seek operation result
+#[derive(Debug, Clone)]
+pub struct SeekResult {
+    pub requested_time: f64,
+    pub actual_time: f64,
+    pub keyframe_offset: u64,
+    pub precision_achieved: f64,
+    pub keyframe_used: KeyframeEntry,
+    pub execution_time: Duration,
+}
+
+// Seek operation record
+#[derive(Debug, Clone)]
+pub struct SeekOperation {
+    pub id: Uuid,
+    pub requested_time: f64,
+    pub actual_time: f64,
+    pub target_offset: u64,
+    pub keyframe_used: KeyframeEntry,
+    pub seek_accuracy: f64,
+    pub execution_time: Duration,
+    pub timestamp: SystemTime,
+}
+
 #[derive(Debug, Clone)]
 pub struct Resolution {
     pub width: u32,
