@@ -71,50 +71,15 @@ impl VideoSegmenter for DefaultVideoSegmenter {
     }
 
     fn find_key_frames(&self, buffer: &[u8]) -> Vec<usize> {
-        // Detect format and parse accordingly
-        let frames = if self.is_h264_format(buffer) {
-            self.parse_h264_frames(buffer)
-        } else if self.is_mp4_format(buffer) {
-            self.parse_mp4_frames(buffer)
-        } else {
-            // Fallback: assume regular intervals
-            self.estimate_key_frames(buffer)
-        };
-        
-        frames.into_iter()
-            .filter(|(_, is_key)| *is_key)
-            .map(|(pos, _)| pos)
-            .collect()
+        // 统一使用固定分片策略，不再区分H.264和MP4格式
+        // 对于文件上传场景，使用固定间隔的关键帧位置
+        self.estimate_key_frames_fixed_size(buffer)
     }
     
     fn find_gop_boundaries(&self, buffer: &[u8]) -> Vec<usize> {
-        // GOP (Group of Pictures) boundaries are typically at key frames
-        // but may include multiple frames between key frames
-        let frames = if self.is_h264_format(buffer) {
-            self.parse_h264_frames(buffer)
-        } else if self.is_mp4_format(buffer) {
-            self.parse_mp4_frames(buffer)
-        } else {
-            self.estimate_key_frames(buffer)
-        };
-        
-        let mut gop_boundaries = Vec::new();
-        let mut last_key_frame = 0;
-        
-        for (pos, is_key) in frames {
-            if is_key && pos > last_key_frame {
-                gop_boundaries.push(last_key_frame);
-                last_key_frame = pos;
-            }
-        }
-        
-        if !gop_boundaries.is_empty() {
-            gop_boundaries.push(last_key_frame);
-        } else {
-            gop_boundaries.push(0);
-        }
-        
-        gop_boundaries
+        // 统一使用固定分片策略，简化GOP边界检测
+        // 基于固定大小创建边界点
+        self.create_fixed_boundaries(buffer)
     }
 
     fn create_segment(
@@ -133,18 +98,17 @@ impl VideoSegmenter for DefaultVideoSegmenter {
             return Err(SegmentError::InvalidParameters);
         }
 
+        // 简化处理：对于文件上传，直接使用原始buffer，不进行复杂的NAL单元验证
+        let segment_buffer = buffer;
+        
         let frame_count = end_frame - start_frame;
         let duration = frame_count as f64 / frame_rate;
         
-        // Find key frame positions within this segment
-        let key_frames = self.find_key_frames(&buffer);
-        let key_frame_positions: Vec<usize> = key_frames.into_iter()
-            .filter(|&pos| pos < buffer.len())
-            .collect();
+        // 简化关键帧检测：固定分片策略下，每个分片都视为独立单元
+        let key_frame_positions = vec![0]; // 简化：每个分片开始都是关键位置
+        let is_key_frame = true; // 简化：所有分片都标记为关键分片
         
-        let is_key_frame = !key_frame_positions.is_empty() && key_frame_positions[0] == 0;
-        
-        let encoding_params = self.extract_encoding_params(&buffer);
+        let encoding_params = self.extract_basic_params(&segment_buffer);
         
         let metadata = SegmentMetadata {
             frame_indices: (start_frame..end_frame).collect(),
@@ -154,7 +118,7 @@ impl VideoSegmenter for DefaultVideoSegmenter {
 
         Ok(VideoSegment {
             id: Uuid::new_v4(),
-            data: buffer,
+            data: segment_buffer,
             timestamp,
             duration,
             frame_count,
@@ -162,6 +126,8 @@ impl VideoSegmenter for DefaultVideoSegmenter {
             metadata,
         })
     }
+    
+
     
     fn extract_encoding_params(&self, buffer: &[u8]) -> HashMap<String, String> {
         let mut params = HashMap::new();
@@ -214,7 +180,7 @@ impl VideoSegmenter for DefaultVideoSegmenter {
 }
 
 impl DefaultVideoSegmenter {
-    /// 公开方法：解析H.264帧
+    /// 公开方法：解析H.264帧 - 修复版本，正确处理NAL单元边界
     pub fn parse_h264_frames(&self, buffer: &[u8]) -> Vec<(usize, bool)> {
         let mut frames = Vec::new();
         let mut i = 0;
@@ -233,17 +199,41 @@ impl DefaultVideoSegmenter {
                 
                 if i + start_code_len < buffer.len() {
                     let nal_type = buffer[i + start_code_len] & 0x1F;
-                    let is_key_frame = matches!(nal_type, 5 | 7 | 8); // IDR, SPS, PPS
-                    frames.push((i, is_key_frame));
+                    
+                    // 只有实际的视频帧才算作帧，过滤掉SEI等辅助信息
+                    let is_video_frame = matches!(nal_type, 1 | 5); // Non-IDR slice, IDR slice
+                    let is_key_frame = nal_type == 5; // 只有IDR帧才是关键帧
+                    
+                    // 只添加实际的视频帧，跳过SPS(7)、PPS(8)、SEI(6)等
+                    if is_video_frame {
+                        frames.push((i, is_key_frame));
+                    }
                 }
                 
-                i += start_code_len;
+                // 跳过整个NAL单元，而不是只跳过起始码
+                let next_start = self.find_next_nal_start(buffer, i + start_code_len);
+                i = if next_start > i { next_start } else { i + start_code_len };
             } else {
                 i += 1;
             }
         }
         
         frames
+    }
+    
+    /// 查找下一个NAL单元的起始位置
+    fn find_next_nal_start(&self, buffer: &[u8], start_pos: usize) -> usize {
+        let mut i = start_pos;
+        while i < buffer.len().saturating_sub(4) {
+            if buffer[i] == 0x00 && buffer[i + 1] == 0x00 {
+                if (buffer[i + 2] == 0x00 && buffer[i + 3] == 0x01) ||
+                   buffer[i + 2] == 0x01 {
+                    return i;
+                }
+            }
+            i += 1;
+        }
+        buffer.len()
     }
     
     /// 公开方法：解析MP4帧
@@ -298,31 +288,84 @@ impl DefaultVideoSegmenter {
         )
     }
     
-    fn estimate_key_frames(&self, buffer: &[u8]) -> Vec<(usize, bool)> {
-        // Fallback estimation: assume key frames every GOP size (typically 30 frames)
-        let gop_size = (self.frame_rate as usize).max(30);
-        let estimated_frame_size = if buffer.len() > gop_size { 
-            buffer.len() / gop_size 
-        } else { 
-            buffer.len() 
-        };
+    /// 统一的固定大小关键帧估算方法
+    fn estimate_key_frames_fixed_size(&self, buffer: &[u8]) -> Vec<usize> {
+        // 使用固定分片大小策略，简化关键帧检测
+        let fixed_chunk_size = 64 * 1024; // 64KB 固定分片大小
+        let mut key_positions = Vec::new();
         
-        let mut frames = Vec::new();
         let mut pos = 0;
-        let mut frame_index = 0;
-        
         while pos < buffer.len() {
-            let is_key = frame_index % gop_size == 0;
-            frames.push((pos, is_key));
-            pos += estimated_frame_size;
-            frame_index += 1;
+            key_positions.push(pos);
+            pos += fixed_chunk_size;
         }
         
-        if frames.is_empty() {
-            frames.push((0, true));
+        if key_positions.is_empty() {
+            key_positions.push(0);
         }
         
-        frames
+        key_positions
+    }
+    
+    /// 创建固定边界点
+    fn create_fixed_boundaries(&self, buffer: &[u8]) -> Vec<usize> {
+        // 基于固定大小创建边界点，简化GOP处理
+        let fixed_chunk_size = 64 * 1024; // 64KB 固定分片大小
+        let mut boundaries = Vec::new();
+        
+        let mut pos = 0;
+        while pos < buffer.len() {
+            boundaries.push(pos);
+            pos += fixed_chunk_size;
+        }
+        
+        // 确保包含结尾边界
+        if !boundaries.is_empty() && boundaries.last() != Some(&buffer.len()) {
+            boundaries.push(buffer.len());
+        }
+        
+        if boundaries.is_empty() {
+            boundaries.push(0);
+        }
+        
+        boundaries
+    }
+    
+    /// 提取基本参数，简化版本
+    fn extract_basic_params(&self, buffer: &[u8]) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        
+        // 基本信息
+        params.insert("segment_size".to_string(), buffer.len().to_string());
+        params.insert("frame_rate".to_string(), self.frame_rate.to_string());
+        params.insert("segmentation_strategy".to_string(), "fixed_size".to_string());
+        
+        // 添加时间戳用于追踪
+        params.insert("creation_timestamp".to_string(), 
+                     std::time::SystemTime::now()
+                         .duration_since(std::time::UNIX_EPOCH)
+                         .unwrap_or_default()
+                         .as_secs()
+                         .to_string());
+        
+        // 检测格式但不进行复杂处理
+        if self.is_h264_format(buffer) {
+            params.insert("detected_format".to_string(), "h264".to_string());
+        } else if self.is_mp4_format(buffer) {
+            params.insert("detected_format".to_string(), "mp4".to_string());
+        } else {
+            params.insert("detected_format".to_string(), "unknown".to_string());
+        }
+        
+        params
+    }
+    
+    fn estimate_key_frames(&self, buffer: &[u8]) -> Vec<(usize, bool)> {
+        // 保留原方法以兼容现有代码，但简化实现
+        let key_positions = self.estimate_key_frames_fixed_size(buffer);
+        key_positions.into_iter()
+            .map(|pos| (pos, true)) // 所有位置都标记为关键帧
+            .collect()
     }
     
     fn find_sps_nal(&self, buffer: &[u8]) -> Option<usize> {
@@ -707,49 +750,26 @@ impl SegmentingStream {
     }
     
     fn should_create_segment(&self) -> bool {
-        match self.options.segment_mode {
-            SegmentMode::Frame => {
-                // For frame-level segmentation, create segment at each key frame
-                if let Some(max_frames) = self.options.max_frames_per_segment {
-                    self.frame_counter >= max_frames
-                } else {
-                    // Default: segment every key frame for minimal latency
-                    self.has_key_frame_at_current_position()
-                }
-            },
-            SegmentMode::Gop => {
-                // For GOP-level segmentation, wait for complete GOP
-                self.has_complete_gop()
-            },
-            SegmentMode::Time => {
-                // Time-based segmentation (not implemented in this task)
-                false
-            }
-        }
-    }
-    
-    fn has_key_frame_at_current_position(&self) -> bool {
-        if self.buffer.is_empty() {
+        // 简化分片决策：统一使用固定大小策略
+        let target_segment_size = 512 * 1024; // 512KB 目标分片大小（更大的分片减少开销）
+        let min_segment_size = 256 * 1024;    // 256KB 最小分片大小
+        let max_segment_size = 1024 * 1024;   // 1MB 最大分片大小
+        
+        let buffer_size = self.buffer.len();
+        
+        // 基本大小检查
+        if buffer_size < min_segment_size {
             return false;
         }
         
-        let segmenter = DefaultVideoSegmenter::new();
-        let key_frames = segmenter.find_key_frames(&self.buffer);
-        
-        // Check if there's a key frame near the current position
-        key_frames.iter().any(|&pos| pos > self.last_key_frame_pos && pos < self.buffer.len())
+        // 达到目标大小或超过最大大小时创建分片
+        buffer_size >= target_segment_size || buffer_size >= max_segment_size
     }
     
-    fn has_complete_gop(&self) -> bool {
-        if self.buffer.is_empty() {
-            return false;
-        }
-        
-        let segmenter = DefaultVideoSegmenter::new();
-        let gop_boundaries = segmenter.find_gop_boundaries(&self.buffer);
-        
-        // Check if we have at least one complete GOP
-        gop_boundaries.len() >= 2
+    // 简化的辅助方法，不再需要复杂的关键帧和GOP检测
+    fn _has_sufficient_data(&self) -> bool {
+        // 简化：只检查是否有足够的数据创建分片
+        !self.buffer.is_empty() && self.buffer.len() >= 32 * 1024 // 32KB 最小阈值
     }
     
     fn create_current_segment(&mut self) -> Result<VideoSegment, SegmentError> {
@@ -765,8 +785,8 @@ impl SegmentingStream {
         let segmenter = DefaultVideoSegmenter::with_frame_rate(self.frame_rate);
         let segment_data = self.buffer.clone();
         
-        // Validate buffer integrity before processing
-        if segment_data.len() > 10 * 1024 * 1024 { // 10MB limit
+        // 简化大小检查
+        if segment_data.len() > 5 * 1024 * 1024 { // 5MB limit，更合理的限制
             self.record_error(
                 SegmentationErrorType::BufferOverflow,
                 format!("Buffer size {} exceeds limit", segment_data.len()),
@@ -775,37 +795,13 @@ impl SegmentingStream {
             return Err(SegmentError::BufferOverflow);
         }
         
-        // Generate comprehensive frame index for this segment
-        let frame_index = match std::panic::catch_unwind(|| {
-            segmenter.generate_frame_index(&segment_data)
-        }) {
-            Ok(index) => index,
-            Err(_) => {
-                self.record_error(
-                    SegmentationErrorType::EncodingError,
-                    "Failed to generate frame index".to_string(),
-                    None,
-                );
-                return Err(SegmentError::EncodingError { 
-                    message: "Frame index generation failed".to_string() 
-                });
-            }
-        };
+        // 简化分片创建：不生成复杂的帧索引，直接创建分片
+        let estimated_frame_count = (segment_data.len() / 1024).max(1); // 简单估算
         
-        // Validate that we have key frames for proper segmentation
-        if frame_index.frames.iter().all(|f| !f.is_key_frame) {
-            self.record_error(
-                SegmentationErrorType::KeyFrameNotFound,
-                "No key frames found in segment".to_string(),
-                None,
-            );
-            // Continue anyway but mark as warning
-        }
-        
-        // Create segment with enhanced metadata and error handling
+        // 直接创建分片，使用简化的参数
         let mut segment = match segmenter.create_segment(
             segment_data,
-            self.frame_counter.saturating_sub(self.get_frames_in_buffer()),
+            self.frame_counter.saturating_sub(estimated_frame_count),
             self.frame_counter,
             self.current_timestamp,
             self.frame_rate,
@@ -821,44 +817,33 @@ impl SegmentingStream {
             }
         };
         
-        // Enhance metadata with frame-level information and error tracking
+        // 添加简化的元数据
         segment.metadata.encoding_params.insert("segment_id".to_string(), self.segment_counter.to_string());
-        segment.metadata.encoding_params.insert("total_frames_in_segment".to_string(), frame_index.total_frames.to_string());
-        segment.metadata.encoding_params.insert("segment_duration".to_string(), frame_index.total_duration.to_string());
+        segment.metadata.encoding_params.insert("estimated_frames".to_string(), estimated_frame_count.to_string());
         segment.metadata.encoding_params.insert("error_count".to_string(), self.error_log.len().to_string());
         segment.metadata.encoding_params.insert("recovery_mode".to_string(), self.recovery_mode.to_string());
+        segment.metadata.encoding_params.insert("segmentation_strategy".to_string(), "fixed_size".to_string());
         
-        // Add quality preservation markers
-        segment.metadata.encoding_params.insert("quality_preserved".to_string(), "true".to_string());
-        segment.metadata.encoding_params.insert("original_encoding_maintained".to_string(), "true".to_string());
-        
-        // Create checkpoint before updating state
+        // 创建检查点
         let checkpoint = self.create_checkpoint();
         self.checkpoint = Some(checkpoint);
         
-        // Update state for next segment
+        // 更新状态
         self.current_timestamp += segment.duration;
         self.segment_counter += 1;
-        self.last_key_frame_pos = self.buffer.len();
+        self.last_key_frame_pos = 0; // 重置，因为使用固定分片策略
         self.buffer.clear();
         
         Ok(segment)
     }
     
     fn get_frames_in_buffer(&self) -> usize {
-        // Estimate number of frames in current buffer
-        // This is a simplified estimation
+        // 简化帧数估算：基于固定分片策略
         if self.buffer.is_empty() {
             0
         } else {
-            let segmenter = DefaultVideoSegmenter::new();
-            if segmenter.is_h264_format(&self.buffer) {
-                segmenter.parse_h264_frames(&self.buffer).len()
-            } else if segmenter.is_mp4_format(&self.buffer) {
-                segmenter.parse_mp4_frames(&self.buffer).len()
-            } else {
-                1 // Fallback
-            }
+            // 简单估算：每1KB大约1帧
+            (self.buffer.len() / 1024).max(1)
         }
     }
 }
@@ -981,6 +966,8 @@ impl Stream for SegmentingStream {
 }
 
 impl DefaultVideoSegmenter {
+    // 移除复杂的NAL单元处理方法，因为采用固定分片策略不再需要
+
     /// Dynamically adjust segmentation granularity based on network conditions
     pub fn adjust_segmentation_mode(&self, _current_mode: SegmentMode, network_conditions: &NetworkConditions) -> SegmentMode {
         match network_conditions.bandwidth_mbps {
@@ -999,48 +986,33 @@ impl DefaultVideoSegmenter {
         }
     }
     
-    /// Generate comprehensive frame-level metadata index
+    /// 简化的帧索引生成
     pub fn generate_frame_index(&self, buffer: &[u8]) -> FrameIndex {
-        let frames = if self.is_h264_format(buffer) {
-            self.parse_h264_frames(buffer)
-        } else if self.is_mp4_format(buffer) {
-            self.parse_mp4_frames(buffer)
-        } else {
-            self.estimate_key_frames(buffer)
-        };
-        
-        let mut frame_entries = Vec::new();
-        let mut current_timestamp = 0.0;
+        // 简化：基于固定分片策略，不进行复杂的帧分析
+        let estimated_frame_count = (buffer.len() / 1024).max(1);
         let frame_duration = 1.0 / self.frame_rate;
+        let total_duration = estimated_frame_count as f64 * frame_duration;
         
-        for (i, (position, is_key_frame)) in frames.iter().enumerate() {
-            let frame_type = if *is_key_frame {
-                FrameType::I
-            } else if i % 3 == 1 {
-                FrameType::P
-            } else {
-                FrameType::B
-            };
-            
+        // 创建简化的帧条目
+        let mut frame_entries = Vec::new();
+        for i in 0..estimated_frame_count {
             frame_entries.push(FrameEntry {
                 index: i,
-                position: *position,
-                timestamp: current_timestamp,
+                position: i * 1024, // 简化：假设每帧1KB
+                timestamp: i as f64 * frame_duration,
                 duration: frame_duration,
-                frame_type,
-                is_key_frame: *is_key_frame,
-                size_bytes: self.estimate_frame_size(buffer, *position, i, &frames),
+                frame_type: FrameType::I, // 简化：所有帧都标记为I帧
+                is_key_frame: true, // 简化：所有帧都是关键帧
+                size_bytes: 1024, // 简化：固定大小
             });
-            
-            current_timestamp += frame_duration;
         }
         
         FrameIndex {
-            total_frames: frame_entries.len(),
-            total_duration: current_timestamp,
+            total_frames: estimated_frame_count,
+            total_duration,
             frame_rate: self.frame_rate,
             frames: frame_entries,
-            encoding_params: self.extract_encoding_params(buffer),
+            encoding_params: self.extract_basic_params(buffer),
         }
     }
     
@@ -1262,15 +1234,50 @@ mod tests {
     fn test_encoding_params_extraction() {
         let segmenter = DefaultVideoSegmenter::new();
         
-        // Test H.264 parameter extraction
+        // Test H.264 parameter extraction with simplified strategy
         let h264_data = vec![
             0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, // SPS with profile/level
         ];
         
-        let params = segmenter.extract_encoding_params(&h264_data);
-        assert!(params.contains_key("codec"));
-        assert_eq!(params.get("codec"), Some(&"h264".to_string()));
+        let params = segmenter.extract_basic_params(&h264_data);
+        assert!(params.contains_key("detected_format"));
+        assert_eq!(params.get("detected_format"), Some(&"h264".to_string()));
+        assert!(params.contains_key("segmentation_strategy"));
+        assert_eq!(params.get("segmentation_strategy"), Some(&"fixed_size".to_string()));
         println!("Extracted parameters: {:?}", params);
+    }
+    
+    #[test]
+    fn test_fixed_size_segmentation() {
+        let segmenter = DefaultVideoSegmenter::new();
+        
+        // Test fixed size key frame detection
+        let test_data = vec![0u8; 128 * 1024]; // 128KB test data
+        let key_frames = segmenter.estimate_key_frames_fixed_size(&test_data);
+        
+        // Should have multiple key frames based on 64KB chunks
+        assert!(key_frames.len() >= 2);
+        assert_eq!(key_frames[0], 0); // First key frame at start
+        assert_eq!(key_frames[1], 64 * 1024); // Second key frame at 64KB
+        
+        println!("Fixed size key frames: {:?}", key_frames);
+    }
+    
+    #[test]
+    fn test_fixed_boundaries() {
+        let segmenter = DefaultVideoSegmenter::new();
+        
+        // Test fixed boundary creation
+        let test_data = vec![0u8; 200 * 1024]; // 200KB test data
+        let boundaries = segmenter.create_fixed_boundaries(&test_data);
+        
+        // Should have boundaries at fixed intervals
+        assert!(boundaries.len() >= 3);
+        assert_eq!(boundaries[0], 0);
+        assert_eq!(boundaries[1], 64 * 1024);
+        assert_eq!(boundaries[2], 128 * 1024);
+        
+        println!("Fixed boundaries: {:?}", boundaries);
     }
     
     #[test]

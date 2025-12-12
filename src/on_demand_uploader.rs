@@ -1170,22 +1170,31 @@ impl OnDemandUploader {
     ) -> Result<(), UploadManagerError> {
         let start_position = seek_position.unwrap_or(0.0);
         
-        // 获取关键帧的file_offset（如果有seek位置）
+        // 获取关键帧的file_offset（如果有seek位置且不为0）
         let start_file_offset = if let Some(position) = seek_position {
-            // 从会话中获取最后的seek结果
-            let sessions = active_sessions.read().await;
-            if let Some(session) = sessions.get(&session_id) {
-                if let Some(ref seek_result) = session.last_seek_result {
-                    info!("Using keyframe file offset: {} for position {:.3}s", 
-                          seek_result.keyframe_offset, position);
-                    Some(seek_result.keyframe_offset)
+            // 只有当seek位置大于0时才使用offset，否则从文件开头读取
+            if position > 0.0 {
+                // 从会话中获取最后的seek结果
+                let sessions = active_sessions.read().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    if let Some(ref seek_result) = session.last_seek_result {
+                        info!("Using keyframe file offset: {} for position {:.3}s", 
+                              seek_result.keyframe_offset, position);
+                        Some(seek_result.keyframe_offset)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             } else {
+                // seek位置为0，从文件开头读取
+                info!("Seek position is 0, reading from file beginning");
                 None
             }
         } else {
+            // 没有seek位置，从文件开头读取
+            info!("No seek position specified, reading from file beginning");
             None
         };
         
@@ -1223,11 +1232,12 @@ impl OnDemandUploader {
         info!("Read {} bytes from file: {:?} (offset: {:?})", 
               file_data.len(), file_info.file_path, start_file_offset);
         
-        // 根据文件格式选择最优处理策略
+        // 统一使用固定大小分片策略，确保完整传输所有数据（包括SPS/PPS等）
         match file_info.format.as_str() {
             "h264" => {
-                info!("Processing H.264 file with frame-level segmentation (low latency mode)");
-                Self::process_h264_file_from_position(
+                info!("Processing H.264 file with fixed-size segmentation (ensures SPS/PPS transmission)");
+                // H.264也使用固定分片策略，确保SPS/PPS等参数集被完整传输
+                Self::process_mp4_file_from_position(
                     session_id,
                     &file_data,
                     start_position,

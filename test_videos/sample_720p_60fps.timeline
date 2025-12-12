@@ -1,0 +1,430 @@
+{
+  "video_file_path": "test_videos/sample_720p_60fps.h264",
+  "video_file_size": 31883667,
+  "video_file_checksum": "31883667_1765520794",
+  "total_duration": 60.0,
+  "keyframes": [
+    {
+      "timestamp": 0.0,
+      "file_offset": 0,
+      "frame_size": 22015,
+      "pts": 0,
+      "dts": 0
+    },
+    {
+      "timestamp": 1.0,
+      "file_offset": 511689,
+      "frame_size": 26440,
+      "pts": 60,
+      "dts": 60
+    },
+    {
+      "timestamp": 2.0,
+      "file_offset": 1038336,
+      "frame_size": 27768,
+      "pts": 120,
+      "dts": 120
+    },
+    {
+      "timestamp": 3.0,
+      "file_offset": 1584985,
+      "frame_size": 28437,
+      "pts": 180,
+      "dts": 180
+    },
+    {
+      "timestamp": 4.0,
+      "file_offset": 2133706,
+      "frame_size": 27646,
+      "pts": 240,
+      "dts": 240
+    },
+    {
+      "timestamp": 5.0,
+      "file_offset": 2649143,
+      "frame_size": 27799,
+      "pts": 300,
+      "dts": 300
+    },
+    {
+      "timestamp": 6.0,
+      "file_offset": 3169068,
+      "frame_size": 28136,
+      "pts": 360,
+      "dts": 360
+    },
+    {
+      "timestamp": 7.0,
+      "file_offset": 3721838,
+      "frame_size": 29146,
+      "pts": 420,
+      "dts": 420
+    },
+    {
+      "timestamp": 8.0,
+      "file_offset": 4267474,
+      "frame_size": 26910,
+      "pts": 480,
+      "dts": 480
+    },
+    {
+      "timestamp": 9.0,
+      "file_offset": 4775026,
+      "frame_size": 25987,
+      "pts": 540,
+      "dts": 540
+    },
+    {
+      "timestamp": 10.0,
+      "file_offset": 5300124,
+      "frame_size": 27428,
+      "pts": 600,
+      "dts": 600
+    },
+    {
+      "timestamp": 11.0,
+      "file_offset": 5843541,
+      "frame_size": 28418,
+      "pts": 660,
+      "dts": 660
+    },
+    {
+      "timestamp": 12.0,
+      "file_offset": 6368455,
+      "frame_size": 27201,
+      "pts": 720,
+      "dts": 720
+    },
+    {
+      "timestamp": 13.0,
+      "file_offset": 6881555,
+      "frame_size": 26717,
+      "pts": 780,
+      "dts": 780
+    },
+    {
+      "timestamp": 14.0,
+      "file_offset": 7406939,
+      "frame_size": 27912,
+      "pts": 840,
+      "dts": 840
+    },
+    {
+      "timestamp": 15.0,
+      "file_offset": 7956177,
+      "frame_size": 28638,
+      "pts": 900,
+      "dts": 900
+    },
+    {
+      "timestamp": 16.0,
+      "file_offset": 8506847,
+      "frame_size": 27741,
+      "pts": 960,
+      "dts": 960
+    },
+    {
+      "timestamp": 17.0,
+      "file_offset": 9021923,
+      "frame_size": 27647,
+      "pts": 1020,
+      "dts": 1020
+    },
+    {
+      "timestamp": 18.0,
+      "file_offset": 9549905,
+      "frame_size": 27973,
+      "pts": 1080,
+      "dts": 1080
+    },
+    {
+      "timestamp": 19.0,
+      "file_offset": 10107645,
+      "frame_size": 29295,
+      "pts": 1140,
+      "dts": 1140
+    },
+    {
+      "timestamp": 20.0,
+      "file_offset": 10655011,
+      "frame_size": 27729,
+      "pts": 1200,
+      "dts": 1200
+    },
+    {
+      "timestamp": 21.0,
+      "file_offset": 11162173,
+      "frame_size": 25912,
+      "pts": 1260,
+      "dts": 1260
+    },
+    {
+      "timestamp": 22.0,
+      "file_offset": 11691357,
+      "frame_size": 27497,
+      "pts": 1320,
+      "dts": 1320
+    },
+    {
+      "timestamp": 23.0,
+      "file_offset": 12232630,
+      "frame_size": 28685,
+      "pts": 1380,
+      "dts": 1380
+    },
+    {
+      "timestamp": 24.0,
+      "file_offset": 12760516,
+      "frame_size": 26839,
+      "pts": 1440,
+      "dts": 1440
+    },
+    {
+      "timestamp": 25.0,
+      "file_offset": 13274811,
+      "frame_size": 26618,
+      "pts": 1500,
+      "dts": 1500
+    },
+    {
+      "timestamp": 26.0,
+      "file_offset": 13807136,
+      "frame_size": 27923,
+      "pts": 1560,
+      "dts": 1560
+    },
+    {
+      "timestamp": 27.0,
+      "file_offset": 14359782,
+      "frame_size": 28849,
+      "pts": 1620,
+      "dts": 1620
+    },
+    {
+      "timestamp": 28.0,
+      "file_offset": 14909715,
+      "frame_size": 27269,
+      "pts": 1680,
+      "dts": 1680
+    },
+    {
+      "timestamp": 29.0,
+      "file_offset": 15424132,
+      "frame_size": 27899,
+      "pts": 1740,
+      "dts": 1740
+    },
+    {
+      "timestamp": 30.0,
+      "file_offset": 15948911,
+      "frame_size": 27907,
+      "pts": 1800,
+      "dts": 1800
+    },
+    {
+      "timestamp": 31.0,
+      "file_offset": 16508159,
+      "frame_size": 29375,
+      "pts": 1860,
+      "dts": 1860
+    },
+    {
+      "timestamp": 32.0,
+      "file_offset": 17054033,
+      "frame_size": 27232,
+      "pts": 1920,
+      "dts": 1920
+    },
+    {
+      "timestamp": 33.0,
+      "file_offset": 17560161,
+      "frame_size": 26444,
+      "pts": 1980,
+      "dts": 1980
+    },
+    {
+      "timestamp": 34.0,
+      "file_offset": 18090680,
+      "frame_size": 27162,
+      "pts": 2040,
+      "dts": 2040
+    },
+    {
+      "timestamp": 35.0,
+      "file_offset": 18633210,
+      "frame_size": 28417,
+      "pts": 2100,
+      "dts": 2100
+    },
+    {
+      "timestamp": 36.0,
+      "file_offset": 19162011,
+      "frame_size": 26307,
+      "pts": 2160,
+      "dts": 2160
+    },
+    {
+      "timestamp": 37.0,
+      "file_offset": 19675935,
+      "frame_size": 26991,
+      "pts": 2220,
+      "dts": 2220
+    },
+    {
+      "timestamp": 38.0,
+      "file_offset": 20200801,
+      "frame_size": 28009,
+      "pts": 2280,
+      "dts": 2280
+    },
+    {
+      "timestamp": 39.0,
+      "file_offset": 20748901,
+      "frame_size": 28956,
+      "pts": 2340,
+      "dts": 2340
+    },
+    {
+      "timestamp": 40.0,
+      "file_offset": 21294486,
+      "frame_size": 27488,
+      "pts": 2400,
+      "dts": 2400
+    },
+    {
+      "timestamp": 41.0,
+      "file_offset": 21805169,
+      "frame_size": 27808,
+      "pts": 2460,
+      "dts": 2460
+    },
+    {
+      "timestamp": 42.0,
+      "file_offset": 22327120,
+      "frame_size": 28910,
+      "pts": 2520,
+      "dts": 2520
+    },
+    {
+      "timestamp": 43.0,
+      "file_offset": 22884241,
+      "frame_size": 29163,
+      "pts": 2580,
+      "dts": 2580
+    },
+    {
+      "timestamp": 44.0,
+      "file_offset": 23426654,
+      "frame_size": 27966,
+      "pts": 2640,
+      "dts": 2640
+    },
+    {
+      "timestamp": 45.0,
+      "file_offset": 23932073,
+      "frame_size": 26572,
+      "pts": 2700,
+      "dts": 2700
+    },
+    {
+      "timestamp": 46.0,
+      "file_offset": 24459405,
+      "frame_size": 27774,
+      "pts": 2760,
+      "dts": 2760
+    },
+    {
+      "timestamp": 47.0,
+      "file_offset": 25001831,
+      "frame_size": 28208,
+      "pts": 2820,
+      "dts": 2820
+    },
+    {
+      "timestamp": 48.0,
+      "file_offset": 25524776,
+      "frame_size": 26789,
+      "pts": 2880,
+      "dts": 2880
+    },
+    {
+      "timestamp": 49.0,
+      "file_offset": 26036925,
+      "frame_size": 27021,
+      "pts": 2940,
+      "dts": 2940
+    },
+    {
+      "timestamp": 50.0,
+      "file_offset": 26565074,
+      "frame_size": 27788,
+      "pts": 3000,
+      "dts": 3000
+    },
+    {
+      "timestamp": 51.0,
+      "file_offset": 27113216,
+      "frame_size": 28807,
+      "pts": 3060,
+      "dts": 3060
+    },
+    {
+      "timestamp": 52.0,
+      "file_offset": 27662356,
+      "frame_size": 28290,
+      "pts": 3120,
+      "dts": 3120
+    },
+    {
+      "timestamp": 53.0,
+      "file_offset": 28176821,
+      "frame_size": 28161,
+      "pts": 3180,
+      "dts": 3180
+    },
+    {
+      "timestamp": 54.0,
+      "file_offset": 28696529,
+      "frame_size": 28145,
+      "pts": 3240,
+      "dts": 3240
+    },
+    {
+      "timestamp": 55.0,
+      "file_offset": 29248098,
+      "frame_size": 29078,
+      "pts": 3300,
+      "dts": 3300
+    },
+    {
+      "timestamp": 56.0,
+      "file_offset": 29790996,
+      "frame_size": 27737,
+      "pts": 3360,
+      "dts": 3360
+    },
+    {
+      "timestamp": 57.0,
+      "file_offset": 30292676,
+      "frame_size": 26178,
+      "pts": 3420,
+      "dts": 3420
+    },
+    {
+      "timestamp": 58.0,
+      "file_offset": 30820594,
+      "frame_size": 27439,
+      "pts": 3480,
+      "dts": 3480
+    },
+    {
+      "timestamp": 59.0,
+      "file_offset": 31361887,
+      "frame_size": 28605,
+      "pts": 3540,
+      "dts": 3540
+    }
+  ],
+  "generated_at": "2025-12-12T08:17:33.055666+00:00",
+  "ffmpeg_version": "ffmpeg version 8.0.1 Copyright (c) 2000-2025 the FFmpeg developers"
+}

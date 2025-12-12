@@ -675,7 +675,20 @@ impl MockPlatformServer {
         }
         
         // 创建两个文件：原始数据文件和调试信息文件
-        let raw_output_path = output_path.with_extension("mp4"); // 原始视频文件
+        // 保持原始文件扩展名，不要强制改为.mp4
+        let raw_output_path = if output_path.extension().and_then(|s| s.to_str()) == Some("recv") {
+            // 如果是.recv文件，去掉.recv后缀，保留原始扩展名
+            let file_stem = output_path.file_stem().unwrap_or_default().to_string_lossy();
+            if file_stem.ends_with(".h264") {
+                output_path.with_file_name(format!("{}", file_stem))
+            } else if file_stem.ends_with(".mp4") {
+                output_path.with_file_name(format!("{}", file_stem))
+            } else {
+                output_path.with_extension("mp4") // 默认情况
+            }
+        } else {
+            output_path.clone()
+        };
         let debug_output_path = output_path.with_extension("debug"); // 调试信息文件
         
         // 写入原始数据（可播放的视频文件）
@@ -735,7 +748,19 @@ impl MockPlatformServer {
                 
                 // 生成统计报告
                 let report_path = output_path.with_extension("report");
-                let raw_video_path = output_path.with_extension("mp4");
+                // 保持原始文件扩展名
+                let raw_video_path = if output_path.extension().and_then(|s| s.to_str()) == Some("recv") {
+                    let file_stem = output_path.file_stem().unwrap_or_default().to_string_lossy();
+                    if file_stem.ends_with(".h264") {
+                        output_path.with_file_name(format!("{}", file_stem))
+                    } else if file_stem.ends_with(".mp4") {
+                        output_path.with_file_name(format!("{}", file_stem))
+                    } else {
+                        output_path.with_extension("mp4")
+                    }
+                } else {
+                    output_path.clone()
+                };
                 let debug_info_path = output_path.with_extension("debug");
                 
                 // 计算接收性能统计
@@ -813,7 +838,7 @@ impl MockPlatformServer {
                 info!("  Performance: {:.1}Mbps overall, {:.1}Mbps peak, avg {:.2}ms/segment", 
                       overall_receive_throughput, file_info.peak_receive_throughput_mbps, file_info.average_receive_time_ms);
                 info!("  Files: {:?} (video), {:?} (debug), {:?} (report)", 
-                      output_path.with_extension("mp4"), output_path.with_extension("debug"), report_path);
+                      raw_video_path, output_path.with_extension("debug"), report_path);
                 
                 // 清理当前文件信息
                 session.current_file = None;

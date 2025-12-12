@@ -131,6 +131,26 @@ impl FFmpegCliParser {
 
     /// 获取视频基本信息
     async fn get_video_info(&self, file_path: &Path) -> Result<VideoInfo, FFmpegError> {
+        // 检查文件扩展名
+        let extension = file_path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        match extension.as_str() {
+            "h264" | "264" => {
+                // 对于H.264原始流，使用特殊的处理方式
+                self.get_h264_video_info(file_path).await
+            }
+            _ => {
+                // 对于容器格式，使用标准方式
+                self.get_container_video_info(file_path).await
+            }
+        }
+    }
+
+    /// 获取容器格式视频信息
+    async fn get_container_video_info(&self, file_path: &Path) -> Result<VideoInfo, FFmpegError> {
         let output = AsyncCommand::new(&self.ffmpeg_path)
             .args(&[
                 "-i",
@@ -147,9 +167,124 @@ impl FFmpegCliParser {
         self.parse_video_info(&stderr)
     }
 
+    /// 获取H.264原始流视频信息
+    async fn get_h264_video_info(&self, file_path: &Path) -> Result<VideoInfo, FFmpegError> {
+        // 对于H.264原始流，使用ffmpeg来获取更准确的信息
+        let output = AsyncCommand::new(&self.ffmpeg_path)
+            .args(&[
+                "-i", file_path.to_str().unwrap(),
+                "-f", "null",
+                "-"
+            ])
+            .output()
+            .await
+            .map_err(|e| FFmpegError::CommandFailed(format!("Failed to get H.264 info: {}", e)))?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        
+        // 从ffmpeg输出中解析信息
+        let mut width = 1280u32;
+        let mut height = 720u32;
+        let mut fps = 30.0f64;
+        let mut frame_count = 0u32;
+        let mut duration_seconds = 0.0f64;
+        
+        // 解析分辨率和帧率
+        for line in stderr.lines() {
+            if line.contains("Video:") && line.contains("fps") {
+                // 解析分辨率 (例如: "1280x720")
+                if let Some(res_match) = line.split_whitespace().find(|s| s.contains('x') && s.chars().next().unwrap_or('a').is_ascii_digit()) {
+                    let parts: Vec<&str> = res_match.split('x').collect();
+                    if parts.len() == 2 {
+                        width = parts[0].parse().unwrap_or(1280);
+                        height = parts[1].parse().unwrap_or(720);
+                    }
+                }
+                
+                // 解析帧率 (查找 "XX fps" 模式，但要小心选择正确的fps值)
+                let words: Vec<&str> = line.split_whitespace().collect();
+                for i in 0..words.len() {
+                    if words[i] == "fps" && i > 0 {
+                        if let Ok(parsed_fps) = words[i-1].parse::<f64>() {
+                            // 对于H.264原始流，ffmpeg可能显示不准确的fps，我们需要从输出流获取
+                            fps = parsed_fps;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // 解析输出流信息 (更准确的帧率)
+            if line.contains("wrapped_avframe") && line.contains("fps") {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                for i in 0..words.len() {
+                    if words[i] == "fps," && i > 0 {
+                        if let Ok(parsed_fps) = words[i-1].parse::<f64>() {
+                            fps = parsed_fps; // 使用输出流的帧率，更准确
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // 解析总帧数和时长 (例如: "frame= 1800 fps=0.0 q=-0.0 Lsize=N/A time=00:01:00.00")
+            if line.contains("frame=") && line.contains("time=") {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                for i in 0..words.len() {
+                    if words[i].starts_with("frame=") {
+                        let frame_str = words[i].trim_start_matches("frame=");
+                        frame_count = frame_str.parse().unwrap_or(0);
+                    }
+                    if words[i].starts_with("time=") {
+                        let time_str = words[i].trim_start_matches("time=");
+                        // 解析时间格式 HH:MM:SS.ss
+                        if let Ok(parsed_duration) = self.parse_time_to_seconds(time_str) {
+                            duration_seconds = parsed_duration;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 计算时长 - 优先使用ffmpeg直接报告的时长
+        let duration = if duration_seconds > 0.0 {
+            duration_seconds
+        } else if fps > 0.0 && frame_count > 0 {
+            frame_count as f64 / fps
+        } else {
+            0.0
+        };
+
+        Ok(VideoInfo {
+            duration,
+            width,
+            height,
+            fps,
+        })
+    }
+
     /// 提取关键帧信息
     async fn extract_keyframes(&self, file_path: &Path) -> Result<Vec<KeyframeInfo>, FFmpegError> {
-        // 使用 ffprobe 获取关键帧信息
+        // 检查文件扩展名来决定处理方式
+        let extension = file_path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        match extension.as_str() {
+            "h264" | "264" => {
+                // 对于原始H.264文件，使用特殊的处理方式
+                self.extract_h264_keyframes(file_path).await
+            }
+            _ => {
+                // 对于容器格式（MP4等），使用标准方式
+                self.extract_container_keyframes(file_path).await
+            }
+        }
+    }
+
+    /// 提取容器格式文件的关键帧信息
+    async fn extract_container_keyframes(&self, file_path: &Path) -> Result<Vec<KeyframeInfo>, FFmpegError> {
         let output = AsyncCommand::new("ffprobe")
             .args(&[
                 "-v", "quiet",
@@ -168,6 +303,32 @@ impl FFmpegCliParser {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         self.parse_keyframes_from_ffprobe(&stdout)
+    }
+
+    /// 提取H.264原始流的关键帧信息
+    async fn extract_h264_keyframes(&self, file_path: &Path) -> Result<Vec<KeyframeInfo>, FFmpegError> {
+        // 首先获取视频信息以确定帧率
+        let video_info = self.get_video_info(file_path).await?;
+        
+        // 使用ffprobe获取帧信息，但不依赖pts_time
+        let output = AsyncCommand::new("ffprobe")
+            .args(&[
+                "-v", "quiet",
+                "-select_streams", "v:0",
+                "-show_entries", "packet=pos,flags,size",
+                "-of", "csv=p=0",
+                file_path.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .map_err(|e| FFmpegError::CommandFailed(format!("Failed to extract H.264 keyframes: {}", e)))?;
+
+        if !output.status.success() {
+            return Err(FFmpegError::CommandFailed("ffprobe command failed for H.264".to_string()));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        self.parse_h264_keyframes_from_ffprobe(&stdout, video_info.fps)
     }
 
     /// 解析视频信息
@@ -214,18 +375,18 @@ impl FFmpegCliParser {
         })
     }
 
-    /// 解析 ffprobe 输出的关键帧信息
+    /// 解析 ffprobe 输出的关键帧信息（容器格式）
     fn parse_keyframes_from_ffprobe(&self, ffprobe_output: &str) -> Result<Vec<KeyframeInfo>, FFmpegError> {
         let mut keyframes = Vec::new();
         
         for line in ffprobe_output.lines() {
             let parts: Vec<&str> = line.split(',').collect();
             if parts.len() >= 4 {
-                // ffprobe 输出格式: pts_time,size,pos,flags
-                let pts_time_str = parts[0];
-                let size_str = parts[1];
-                let pos_str = parts[2];
-                let flags_str = parts[3];
+                // ffprobe 输出格式: pos,pts_time,flags,size
+                let pos_str = parts[0];
+                let pts_time_str = parts[1];
+                let flags_str = parts[2];
+                let size_str = parts[3];
                 
                 // 只处理关键帧 (flags 包含 "K")
                 if flags_str.contains('K') {
@@ -248,6 +409,51 @@ impl FFmpegCliParser {
         
         if keyframes.is_empty() {
             return Err(FFmpegError::ParseError("No keyframes found in video".to_string()));
+        }
+        
+        // 按时间戳排序
+        keyframes.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+        
+        Ok(keyframes)
+    }
+
+    /// 解析 H.264 原始流的关键帧信息
+    fn parse_h264_keyframes_from_ffprobe(&self, ffprobe_output: &str, fps: f64) -> Result<Vec<KeyframeInfo>, FFmpegError> {
+        let mut keyframes = Vec::new();
+        let mut frame_count = 0;
+        
+        for line in ffprobe_output.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 3 {
+                // ffprobe 输出格式: size,pos,flags
+                let size_str = parts[0];
+                let pos_str = parts[1];
+                let flags_str = parts[2];
+                
+                // 只处理关键帧 (flags 包含 "K")
+                if flags_str.contains('K') {
+                    if let (Ok(file_offset), Ok(frame_size)) = (
+                        pos_str.parse::<u64>(),
+                        size_str.parse::<u32>(),
+                    ) {
+                        // 对于H.264原始流，根据帧计数和帧率计算时间戳
+                        let timestamp = frame_count as f64 / fps;
+                        
+                        keyframes.push(KeyframeInfo {
+                            timestamp,
+                            file_offset,
+                            frame_size,
+                            pts: (timestamp * fps) as i64,
+                            dts: (timestamp * fps) as i64,
+                        });
+                    }
+                }
+                frame_count += 1;
+            }
+        }
+        
+        if keyframes.is_empty() {
+            return Err(FFmpegError::ParseError("No keyframes found in H.264 stream".to_string()));
         }
         
         // 按时间戳排序
@@ -301,6 +507,59 @@ impl FFmpegCliParser {
             .map_err(|_| FFmpegError::ParseError(format!("Invalid seconds: {}", parts[2])))?;
         
         Ok(hours * 3600.0 + minutes * 60.0 + seconds)
+    }
+
+    /// 解析H.264视频信息
+    fn parse_h264_video_info(&self, ffprobe_output: &str) -> Result<VideoInfo, FFmpegError> {
+        // ffprobe输出格式: width,height,r_frame_rate,nb_read_frames
+        let line = ffprobe_output.lines().next()
+            .ok_or_else(|| FFmpegError::ParseError("No output from ffprobe".to_string()))?;
+        
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() < 4 {
+            return Err(FFmpegError::ParseError(format!("Invalid ffprobe output format: {}", line)));
+        }
+
+        // 解析分辨率
+        let width: u32 = parts[0].parse()
+            .map_err(|_| FFmpegError::ParseError(format!("Invalid width: {}", parts[0])))?;
+        let height: u32 = parts[1].parse()
+            .map_err(|_| FFmpegError::ParseError(format!("Invalid height: {}", parts[1])))?;
+
+        // 解析帧率 (格式可能是 "120/1" 或 "60")
+        let fps_str = parts[2];
+        let fps = if fps_str.contains('/') {
+            let fps_parts: Vec<&str> = fps_str.split('/').collect();
+            if fps_parts.len() == 2 {
+                let numerator: f64 = fps_parts[0].parse()
+                    .map_err(|_| FFmpegError::ParseError(format!("Invalid fps numerator: {}", fps_parts[0])))?;
+                let denominator: f64 = fps_parts[1].parse()
+                    .map_err(|_| FFmpegError::ParseError(format!("Invalid fps denominator: {}", fps_parts[1])))?;
+                numerator / denominator
+            } else {
+                60.0 // 默认值
+            }
+        } else {
+            fps_str.parse::<f64>().unwrap_or(60.0)
+        };
+
+        // 解析帧数
+        let frame_count: u32 = parts[3].parse()
+            .map_err(|_| FFmpegError::ParseError(format!("Invalid frame count: {}", parts[3])))?;
+
+        // 计算时长
+        let duration = if fps > 0.0 {
+            frame_count as f64 / fps
+        } else {
+            0.0
+        };
+
+        Ok(VideoInfo {
+            duration,
+            width,
+            height,
+            fps,
+        })
     }
 
     /// 计算文件校验和
