@@ -27,6 +27,8 @@ pub mod serde_helpers;
 pub mod transmission_config;
 pub mod mock_server;
 pub mod on_demand_uploader;
+pub mod live_encoder;
+pub mod h264_encoder;
 
 pub use types::*;
 pub use errors::*;

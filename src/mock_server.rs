@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::path::PathBuf;
-use tokio::sync::{Mutex, mpsc};
-use tokio::fs::{File, create_dir_all};
+use tokio::sync::Mutex;
+use tokio::fs::create_dir_all;
 use tokio::io::AsyncWriteExt;
 use quinn::{ServerConfig, Endpoint, Connection, RecvStream, SendStream};
 use rustls::{Certificate, PrivateKey, ServerConfig as TlsServerConfig};
@@ -35,6 +35,19 @@ pub struct ServerSession {
     pub status: SessionStatus,
     /// 当前接收的文件信息
     pub current_file: Option<ReceivingFileInfo>,
+    /// 活跃的直播流
+    pub live_streams: HashMap<String, LiveStreamInfo>,
+}
+
+/// 直播流信息
+#[derive(Debug, Clone)]
+pub struct LiveStreamInfo {
+    pub stream_id: String,
+    pub output_path: std::path::PathBuf,
+    pub start_time: std::time::SystemTime,
+    pub frames_received: u64,
+    pub bytes_received: u64,
+    pub is_active: bool,
 }
 
 /// 正在接收的文件信息
@@ -53,6 +66,9 @@ pub struct ReceivingFileInfo {
     pub total_segments_received: u64,
     pub average_receive_time_ms: f64,
     pub peak_receive_throughput_mbps: f64,
+    // 新增：直播流相关
+    pub is_live_stream: bool,
+    pub live_stream_id: Option<String>,
 }
 
 /// 会话状态
@@ -192,6 +208,9 @@ impl MockPlatformServer {
                 total_segments_received: 0,
                 average_receive_time_ms: 0.0,
                 peak_receive_throughput_mbps: 0.0,
+                // 初始化直播流字段
+                is_live_stream: false,
+                live_stream_id: None,
             });
             
             info!("Requested file upload: {} from session {}", file_path, session_id);
@@ -242,6 +261,65 @@ impl MockPlatformServer {
                 })?;
 
             info!("Sent playback control: {:?} to session {}", command, session_id);
+            Ok(())
+        } else {
+            Err(TransportError::ConnectionFailed { reason: format!("Session {} not found", session_id) })
+        }
+    }
+
+    /// 发送直播流控制命令
+    pub async fn send_live_stream_control(
+        &self, 
+        session_id: Uuid, 
+        command: PlaybackCommand
+    ) -> Result<(), TransportError> {
+        // 根据命令类型进行预处理
+        match &command {
+            PlaybackCommand::StartLive { stream_id, .. } => {
+                // 启动直播流接收
+                self.start_live_stream_reception(session_id, stream_id.clone()).await?;
+            }
+            PlaybackCommand::StopLive { stream_id } => {
+                // 停止直播流接收
+                self.stop_live_stream_reception(session_id, stream_id.clone()).await?;
+            }
+            _ => {}
+        }
+        
+        let sessions = self.sessions.lock().await;
+        
+        if let Some(session) = sessions.get(&session_id) {
+            let control_msg = ProtocolMessage {
+                message_type: MessageType::LiveStreamControl,
+                session_id,
+                timestamp: std::time::SystemTime::now(),
+                sequence_number: 1,
+                payload: serde_json::to_vec(&command)
+                    .map_err(|e| TransportError::SerializationError { message: e.to_string() })?,
+            };
+
+            // 通过QUIC连接发送直播控制消息到客户端
+            let mut send_stream = session.connection.inner.open_uni().await
+                .map_err(|e| TransportError::StreamCreationFailed { 
+                    reason: format!("Failed to open live control stream: {}", e) 
+                })?;
+                
+            let serialized = serde_json::to_vec(&control_msg)
+                .map_err(|e| TransportError::SerializationError { 
+                    message: format!("Failed to serialize live control message: {}", e) 
+                })?;
+                
+            send_stream.write_all(&serialized).await
+                .map_err(|e| TransportError::NetworkError { 
+                    message: format!("Failed to send live control message: {}", e) 
+                })?;
+                
+            send_stream.finish().await
+                .map_err(|e| TransportError::NetworkError { 
+                    message: format!("Failed to finish live control stream: {}", e) 
+                })?;
+
+            info!("Sent live stream control: {:?} to session {}", command, session_id);
             Ok(())
         } else {
             Err(TransportError::ConnectionFailed { reason: format!("Session {} not found", session_id) })
@@ -380,6 +458,7 @@ impl MockPlatformServer {
             received_segments: Vec::new(),
             status: SessionStatus::Connected,
             current_file: None,
+            live_streams: HashMap::new(),
         };
 
         sessions.lock().await.insert(session_id, session);
@@ -515,10 +594,24 @@ impl MockPlatformServer {
                     file_info.peak_receive_throughput_mbps = segment_throughput;
                 }
                 
+                // 检查是否是直播流数据
+                let is_live_stream = file_info.is_live_stream;
+                let live_stream_id = file_info.live_stream_id.clone();
+                
                 // 分类存储分片
                 match stream_type {
                     StreamType::Video => file_info.video_segments.push(received_segment.clone()),
                     StreamType::Audio => file_info.audio_segments.push(received_segment.clone()),
+                }
+                
+                // 如果是直播流，更新直播流统计
+                if is_live_stream {
+                    if let Some(stream_id) = &live_stream_id {
+                        if let Some(live_stream) = session.live_streams.get_mut(stream_id) {
+                            live_stream.frames_received += 1;
+                            live_stream.bytes_received += segment.data.len() as u64;
+                        }
+                    }
                 }
                 
                 // 异步写入文件
@@ -550,9 +643,19 @@ impl MockPlatformServer {
                         0.0
                     };
                     
-                    info!("Received {} segment {:.3}s ({} bytes, {:.2}ms, {:.1}Mbps) to {:?}", 
-                          segment_type_name, segment_timestamp, segment_data.len(), 
-                          receive_duration.as_millis(), throughput_mbps, output_path);
+                    // 根据是否是直播流显示不同的日志
+                    if is_live_stream {
+                        if let Some(_stream_id) = &live_stream_id {
+                            println!("📺 LIVE RECEIVE: {}ms - {} segment {:.3}s ({} bytes, {:.1}Mbps) -> {:?}", 
+                                   std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                       .unwrap_or_default().as_millis(),
+                                   segment_type_name, segment_timestamp, segment_data.len(), throughput_mbps, output_path);
+                        }
+                    } else {
+                        info!("Received {} segment {:.3}s ({} bytes, {:.2}ms, {:.1}Mbps) to {:?}", 
+                              segment_type_name, segment_timestamp, segment_data.len(), 
+                              receive_duration.as_millis(), throughput_mbps, output_path);
+                    }
                 }
             } else {
                 drop(sessions_guard);
@@ -882,6 +985,181 @@ impl MockPlatformServer {
 
         Ok(server_config)
     }
+
+    /// 开始接收直播流
+    async fn start_live_stream_reception(&self, session_id: Uuid, stream_id: String) -> Result<(), TransportError> {
+        let mut sessions = self.sessions.lock().await;
+        
+        if let Some(session) = sessions.get_mut(&session_id) {
+            // 创建直播流输出目录
+            let live_dir = std::path::PathBuf::from("recv_live_streams");
+            if let Err(e) = tokio::fs::create_dir_all(&live_dir).await {
+                warn!("Failed to create live streams directory: {}", e);
+            }
+            
+            // 生成带时间戳的文件名
+            let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+            let output_filename = format!("{}_{}.h264", stream_id, timestamp);
+            let output_path = live_dir.join(&output_filename);
+            
+            info!("🎬 Starting live stream reception: {} -> {:?}", stream_id, output_path);
+            
+            // 创建直播流信息
+            let live_stream_info = LiveStreamInfo {
+                stream_id: stream_id.clone(),
+                output_path: output_path.clone(),
+                start_time: std::time::SystemTime::now(),
+                frames_received: 0,
+                bytes_received: 0,
+                is_active: true,
+            };
+            
+            session.live_streams.insert(stream_id.clone(), live_stream_info);
+            
+            // 如果没有当前文件，创建一个用于直播流
+            if session.current_file.is_none() {
+                session.current_file = Some(ReceivingFileInfo {
+                    file_path: format!("live_stream_{}", stream_id),
+                    output_path: output_path.clone(),
+                    total_size: 0,
+                    received_size: 0,
+                    video_segments: Vec::new(),
+                    audio_segments: Vec::new(),
+                    start_time: std::time::SystemTime::now(),
+                    reception_start_time: None,
+                    last_segment_time: None,
+                    total_segments_received: 0,
+                    average_receive_time_ms: 0.0,
+                    peak_receive_throughput_mbps: 0.0,
+                    is_live_stream: true,
+                    live_stream_id: Some(stream_id.clone()),
+                });
+            }
+            
+            info!("✅ Live stream reception started: {}", stream_id);
+            Ok(())
+        } else {
+            Err(TransportError::ConnectionFailed { 
+                reason: format!("Session {} not found", session_id) 
+            })
+        }
+    }
+    
+    /// 停止接收直播流
+    async fn stop_live_stream_reception(&self, session_id: Uuid, stream_id: String) -> Result<(), TransportError> {
+        let mut sessions = self.sessions.lock().await;
+        
+        if let Some(session) = sessions.get_mut(&session_id) {
+            if let Some(mut live_stream) = session.live_streams.remove(&stream_id) {
+                live_stream.is_active = false;
+                
+                let duration = live_stream.start_time.elapsed().unwrap_or_default();
+                let avg_fps = if duration.as_secs_f64() > 0.0 {
+                    live_stream.frames_received as f64 / duration.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let avg_bitrate = if duration.as_secs_f64() > 0.0 {
+                    (live_stream.bytes_received as f64 * 8.0) / duration.as_secs_f64() / 1_000_000.0
+                } else {
+                    0.0
+                };
+                
+                info!("🛑 Live stream reception stopped: {}", stream_id);
+                info!("   Duration: {:.2}s", duration.as_secs_f64());
+                info!("   Frames: {}", live_stream.frames_received);
+                info!("   Bytes: {}", live_stream.bytes_received);
+                info!("   Avg FPS: {:.1}", avg_fps);
+                info!("   Avg Bitrate: {:.1} Mbps", avg_bitrate);
+                info!("   Output file: {:?}", live_stream.output_path);
+                
+                // 生成直播流报告
+                self.generate_live_stream_report(&live_stream, duration).await?;
+                
+                // 如果当前文件是这个直播流，清除它
+                if let Some(ref current_file) = session.current_file {
+                    if current_file.is_live_stream && 
+                       current_file.live_stream_id.as_ref() == Some(&stream_id) {
+                        session.current_file = None;
+                    }
+                }
+            }
+            
+            Ok(())
+        } else {
+            Err(TransportError::ConnectionFailed { 
+                reason: format!("Session {} not found", session_id) 
+            })
+        }
+    }
+    
+    /// 生成直播流报告
+    async fn generate_live_stream_report(&self, live_stream: &LiveStreamInfo, duration: std::time::Duration) -> Result<(), TransportError> {
+        let report_path = live_stream.output_path.with_extension("report");
+        let mp4_path = live_stream.output_path.with_extension("mp4");
+        
+        let avg_fps = if duration.as_secs_f64() > 0.0 {
+            live_stream.frames_received as f64 / duration.as_secs_f64()
+        } else {
+            0.0
+        };
+        
+        let avg_bitrate = if duration.as_secs_f64() > 0.0 {
+            (live_stream.bytes_received as f64 * 8.0) / duration.as_secs_f64() / 1_000_000.0
+        } else {
+            0.0
+        };
+        
+        let report_content = format!(
+            "=== 直播流接收完成报告 ===\n\
+             流ID: {}\n\
+             开始时间: {:?}\n\
+             持续时间: {:.2}秒\n\
+             接收帧数: {}\n\
+             接收字节数: {} bytes ({:.2} MB)\n\
+             平均帧率: {:.1} fps\n\
+             平均码率: {:.1} Mbps\n\
+             \n\
+             输出文件:\n\
+             - H.264原始流: {:?}\n\
+             - 转换后MP4: {:?} (需手动转换)\n\
+             - 统计报告: {:?}\n\
+             \n\
+             转换命令:\n\
+             ffmpeg -i {:?} -c copy {:?}\n\
+             \n\
+             播放命令:\n\
+             ffplay {:?}\n\
+             vlc {:?}\n\
+             \n\
+             说明:\n\
+             - .h264 文件为原始H.264流，包含时间戳叠加\n\
+             - 可使用上述命令转换为MP4格式播放\n\
+             - 时间戳叠加可用于延迟测试\n\
+             ===========================\n",
+            live_stream.stream_id,
+            live_stream.start_time,
+            duration.as_secs_f64(),
+            live_stream.frames_received,
+            live_stream.bytes_received,
+            live_stream.bytes_received as f64 / 1024.0 / 1024.0,
+            avg_fps,
+            avg_bitrate,
+            live_stream.output_path,
+            mp4_path,
+            report_path,
+            live_stream.output_path,
+            mp4_path,
+            live_stream.output_path,
+            mp4_path
+        );
+        
+        tokio::fs::write(&report_path, report_content).await
+            .map_err(|e| TransportError::NetworkError { message: e.to_string() })?;
+        
+        info!("📊 Live stream report generated: {:?}", report_path);
+        Ok(())
+    }
 }
 
 /// 分片数据结构
@@ -910,6 +1188,24 @@ pub enum PlaybackCommand {
     Pause,
     Resume,
     Stop,
+    StartLive { 
+        stream_id: String,
+        quality: LiveStreamQuality,
+        timestamp_overlay: bool,
+    },
+    StopLive { 
+        stream_id: String,
+    },
+}
+
+/// 直播流质量设置
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LiveStreamQuality {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub keyframe_interval: u32, // GOP size
 }
 
 /// 文件列表查询载荷

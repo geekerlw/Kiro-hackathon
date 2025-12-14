@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::{Mutex, mpsc, RwLock};
 use tracing::{info, warn, error, debug};
 use uuid::Uuid;
@@ -18,7 +19,8 @@ use crate::controller::{PlaybackController, DefaultPlaybackController};
 use crate::monitor::{PerformanceMonitor, DefaultPerformanceMonitor};
 use crate::timeline_manager::{TimelineManager, CacheStats};
 use crate::ffmpeg_cli_parser::TimelineData;
-use crate::mock_server::{FileRequestPayload, PlaybackCommand};
+use crate::mock_server::{FileRequestPayload, PlaybackCommand, LiveStreamQuality};
+use crate::live_encoder::{LiveH264Encoder, LiveEncoderConfig, OutputFormat};
 
 /// 按需上传管理器 - 等待平台请求后才开始上传
 pub struct OnDemandUploader {
@@ -44,6 +46,10 @@ pub struct OnDemandUploader {
     control_receiver: Option<mpsc::Receiver<PlatformMessage>>,
     /// 服务器连接
     server_connection: Option<QUICConnection>,
+    /// 实时编码器
+    live_encoder: Arc<Mutex<Option<LiveH264Encoder>>>,
+    /// 活跃的直播会话
+    live_sessions: Arc<RwLock<HashMap<String, LiveSession>>>,
 }
 
 /// 上传会话信息
@@ -97,6 +103,19 @@ pub struct LocalFileInfo {
     pub timeline_file_path: Option<PathBuf>,
 }
 
+/// 直播会话信息
+#[derive(Debug, Clone)]
+pub struct LiveSession {
+    pub stream_id: String,
+    pub session_id: Uuid,
+    pub quality: LiveStreamQuality,
+    pub start_time: SystemTime,
+    pub frames_transmitted: u64,
+    pub bytes_transmitted: u64,
+    pub is_active: bool,
+    pub timestamp_overlay: bool,
+}
+
 /// 平台消息
 #[derive(Debug, Clone)]
 pub enum PlatformMessage {
@@ -108,6 +127,10 @@ pub enum PlatformMessage {
         playback_rate: f64,
     },
     PlaybackControl {
+        session_id: Uuid,
+        command: PlaybackCommand,
+    },
+    LiveStreamControl {
         session_id: Uuid,
         command: PlaybackCommand,
     },
@@ -135,6 +158,8 @@ impl OnDemandUploader {
             file_registry: Arc::new(RwLock::new(HashMap::new())),
             control_receiver: None,
             server_connection: None,
+            live_encoder: Arc::new(Mutex::new(None)),
+            live_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -485,6 +510,23 @@ impl OnDemandUploader {
                     })?;
             }
             
+            MessageType::LiveStreamControl => {
+                let command: crate::mock_server::PlaybackCommand = serde_json::from_slice(&message.payload)
+                    .map_err(|e| TransportError::SerializationError { 
+                        message: format!("Failed to parse live stream command: {}", e) 
+                    })?;
+                    
+                let platform_msg = PlatformMessage::LiveStreamControl {
+                    session_id: message.session_id,
+                    command,
+                };
+                
+                sender.send(platform_msg).await
+                    .map_err(|e| TransportError::NetworkError { 
+                        message: format!("Failed to forward live stream control: {}", e) 
+                    })?;
+            }
+            
             MessageType::SessionEnd => {
                 let platform_msg = PlatformMessage::SessionEnd {
                     session_id: message.session_id,
@@ -731,6 +773,47 @@ impl OnDemandUploader {
                         PlaybackCommand::Stop => {
                             session.status = UploadStatus::Completed;
                         }
+                        
+                        PlaybackCommand::StartLive { .. } | PlaybackCommand::StopLive { .. } => {
+                            // 这些命令应该通过 LiveStreamControl 消息处理，而不是 PlaybackControl
+                            warn!("Received live stream command via PlaybackControl, should use LiveStreamControl");
+                        }
+                    }
+                }
+            }
+            
+            PlatformMessage::LiveStreamControl { session_id, command } => {
+                info!("Received live stream control for session {}: {:?}", session_id, command);
+                
+                match command {
+                    PlaybackCommand::StartLive { stream_id, quality, timestamp_overlay } => {
+                        info!("Starting live stream: {} for session {}", stream_id, session_id);
+                        
+                        // 启动直播编码任务
+                        Self::start_live_stream(
+                            session_id,
+                            stream_id,
+                            quality,
+                            timestamp_overlay,
+                            active_sessions.clone(),
+                            transport.clone(),
+                            connection.clone(),
+                        ).await?;
+                    }
+                    
+                    PlaybackCommand::StopLive { stream_id } => {
+                        info!("Stopping live stream: {} for session {}", stream_id, session_id);
+                        
+                        // 停止直播编码任务
+                        Self::stop_live_stream(
+                            session_id,
+                            stream_id,
+                            active_sessions.clone(),
+                        ).await?;
+                    }
+                    
+                    _ => {
+                        warn!("Unsupported live stream command: {:?}", command);
                     }
                 }
             }
@@ -1791,6 +1874,161 @@ impl OnDemandUploader {
             warn!("Session {} not found, stopping transmission", session_id);
             Ok(false)
         }
+    }
+    
+    /// 启动直播流
+    async fn start_live_stream(
+        session_id: Uuid,
+        stream_id: String,
+        quality: LiveStreamQuality,
+        timestamp_overlay: bool,
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
+        connection: QUICConnection,
+    ) -> Result<(), UploadManagerError> {
+        info!("Starting live stream {} for session {}", stream_id, session_id);
+        
+        // 创建编码器配置
+        let encoder_config = LiveEncoderConfig {
+            quality: quality.clone(),
+            timestamp_overlay,
+            screen_capture: true, // 启用屏幕录制
+            output_format: OutputFormat::H264Raw,
+            segment_duration_ms: 1000 / quality.fps as u64, // 每帧一个分片
+            timestamp_format: crate::live_encoder::TimestampFormat::Combined, // 组合时间戳显示
+        };
+        
+        // 创建并启动编码器
+        let mut encoder = LiveH264Encoder::new(encoder_config);
+        
+        match encoder.start_encoding(stream_id.clone()).await {
+            Ok(_) => {
+                info!("Live encoder started successfully for stream: {}", stream_id);
+                
+                // 启动传输任务
+                tokio::spawn(async move {
+                    Self::live_stream_transmission_loop(
+                        session_id,
+                        stream_id.clone(),
+                        encoder,
+                        active_sessions,
+                        transport,
+                        connection,
+                    ).await;
+                });
+                
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to start live encoder: {}", e);
+                Err(UploadManagerError::TransportError(e))
+            }
+        }
+    }
+    
+    /// 停止直播流
+    async fn stop_live_stream(
+        session_id: Uuid,
+        stream_id: String,
+        _active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+    ) -> Result<(), UploadManagerError> {
+        info!("Stopping live stream {} for session {}", stream_id, session_id);
+        
+        // 这里可以添加停止编码器的逻辑
+        // 由于编码器在独立的任务中运行，我们可以通过设置标志来停止它
+        
+        Ok(())
+    }
+    
+    /// 直播流传输循环
+    async fn live_stream_transmission_loop(
+        session_id: Uuid,
+        stream_id: String,
+        mut encoder: LiveH264Encoder,
+        active_sessions: Arc<RwLock<HashMap<Uuid, UploadSession>>>,
+        transport: Arc<DefaultQUICTransport>,
+        mut connection: QUICConnection,
+    ) {
+        info!("Starting live stream transmission loop for stream: {}", stream_id);
+        
+        let mut frame_count = 0u64;
+        let mut total_bytes = 0u64;
+        let start_time = std::time::Instant::now();
+        let mut last_activity = std::time::Instant::now();
+        
+        // 直播流运行时间限制（默认30秒，可以根据需要调整）
+        let max_duration = std::time::Duration::from_secs(30);
+        
+        loop {
+            // 检查是否超过最大运行时间
+            if start_time.elapsed() > max_duration {
+                info!("Live stream {} reached maximum duration, stopping", stream_id);
+                break;
+            }
+            
+            // 检查编码器状态
+            let encoder_state = encoder.get_encoding_state().await;
+            if !encoder_state.is_encoding {
+                info!("Encoder stopped for stream {}, ending transmission", stream_id);
+                break;
+            }
+            
+            // 获取下一个编码分片
+            if let Some(segment) = encoder.get_next_segment().await {
+                let segment_size = match &segment {
+                    crate::types::Segment::Video(v) => v.data.len(),
+                    crate::types::Segment::Audio(a) => a.data.len(),
+                };
+                
+                // 发送分片
+                match transport.send_segment(&mut connection, segment).await {
+                    Ok(_) => {
+                        frame_count += 1;
+                        total_bytes += segment_size as u64;
+                        last_activity = std::time::Instant::now();
+                        
+                        // 每10帧打印一次统计信息（更频繁的日志）
+                        if frame_count % 10 == 0 {
+                            let elapsed = start_time.elapsed();
+                            let fps = frame_count as f64 / elapsed.as_secs_f64();
+                            let mbps = (total_bytes as f64 * 8.0) / (elapsed.as_secs_f64() * 1_000_000.0);
+                            
+                            info!("📡 LIVE STREAM {}: {} frames, {:.1} fps, {:.1} Mbps, {} bytes total", 
+                                  stream_id, frame_count, fps, mbps, total_bytes);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to send live stream segment: {}", e);
+                        // 不要立即退出，尝试继续
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            } else {
+                // 没有新的分片，短暂等待
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                
+                // 检查是否长时间没有新分片
+                if last_activity.elapsed() > std::time::Duration::from_secs(5) {
+                    warn!("No new segments for 5 seconds, checking encoder status");
+                    let encoder_state = encoder.get_encoding_state().await;
+                    info!("Encoder state: encoding={}, frames={}", 
+                          encoder_state.is_encoding, encoder_state.frames_encoded);
+                    last_activity = std::time::Instant::now(); // 重置计时器
+                }
+            }
+        }
+        
+        // 停止编码器
+        if let Err(e) = encoder.stop_encoding().await {
+            error!("Failed to stop encoder: {}", e);
+        }
+        
+        let elapsed = start_time.elapsed();
+        let fps = frame_count as f64 / elapsed.as_secs_f64();
+        let mbps = (total_bytes as f64 * 8.0) / (elapsed.as_secs_f64() * 1_000_000.0);
+        
+        info!("🏁 LIVE STREAM {} COMPLETED: {} frames in {:.2}s, avg {:.1} fps, {:.1} Mbps", 
+              stream_id, frame_count, elapsed.as_secs_f64(), fps, mbps);
     }
     
     /// 标记会话错误

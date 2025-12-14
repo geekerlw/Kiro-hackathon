@@ -91,11 +91,14 @@ async fn start_interactive_console(server: MockPlatformServer) -> Result<(), Box
     info!("  pause [session_id] - Pause upload");
     info!("  resume [session_id] - Resume upload");
     info!("  stop [session_id] - Stop upload");
+    info!("  live start [session_id] [stream_name] - Start live H.264 streaming with timestamp overlay");
+    info!("  live stop [session_id] [stream_name] - Stop live streaming");
     info!("  stats [session_id] - Show session statistics");
     info!("  finalize [session_id] - Finalize file reception and generate report");
     info!("  quit - Exit server");
     info!("");
     info!("Note: If session_id is not provided, the first available session will be used.");
+    info!("Live streaming: Generates real-time H.264 with millisecond timestamps for latency testing.");
 
     let stdin = tokio::io::stdin();
     let mut lines = tokio::io::BufReader::new(stdin).lines();
@@ -396,7 +399,120 @@ async fn start_interactive_console(server: MockPlatformServer) -> Result<(), Box
                 }
             }
 
-
+            "live" => {
+                if parts.len() >= 2 {
+                    match parts[1] {
+                        "start" => {
+                            if parts.len() >= 3 {
+                                if let Some(session_id) = get_session_id(&server, parts[2]).await {
+                                    let stream_id = if parts.len() >= 4 {
+                                        parts[3].to_string()
+                                    } else {
+                                        format!("live_stream_{}", session_id)
+                                    };
+                                    
+                                    let quality = video_streaming_uploader::mock_server::LiveStreamQuality {
+                                        width: 1280,
+                                        height: 720,
+                                        fps: 30,
+                                        bitrate_kbps: 2000,
+                                        keyframe_interval: 30,
+                                    };
+                                    
+                                    let command = PlaybackCommand::StartLive {
+                                        stream_id: stream_id.clone(),
+                                        quality,
+                                        timestamp_overlay: true,
+                                    };
+                                    
+                                    match server.send_live_stream_control(session_id, command).await {
+                                        Ok(_) => info!("🎬 Started live stream '{}' for session {}", stream_id, session_id),
+                                        Err(e) => error!("Failed to start live stream: {}", e),
+                                    }
+                                } else {
+                                    info!("Usage: live start <session_id> [stream_name]");
+                                }
+                            } else {
+                                // 如果没有提供session_id，使用第一个可用的会话
+                                let sessions = server.get_all_sessions().await;
+                                if let Some((session_id, _)) = sessions.first() {
+                                    let stream_id = format!("live_stream_{}", session_id);
+                                    let quality = video_streaming_uploader::mock_server::LiveStreamQuality {
+                                        width: 1280,
+                                        height: 720,
+                                        fps: 30,
+                                        bitrate_kbps: 2000,
+                                        keyframe_interval: 30,
+                                    };
+                                    
+                                    let command = PlaybackCommand::StartLive {
+                                        stream_id: stream_id.clone(),
+                                        quality,
+                                        timestamp_overlay: true,
+                                    };
+                                    
+                                    match server.send_live_stream_control(*session_id, command).await {
+                                        Ok(_) => info!("🎬 Started live stream '{}' for session {}", stream_id, session_id),
+                                        Err(e) => error!("Failed to start live stream: {}", e),
+                                    }
+                                } else {
+                                    info!("Usage: live start [session_id] [stream_name] - No active sessions available");
+                                }
+                            }
+                        }
+                        
+                        "stop" => {
+                            if parts.len() >= 3 {
+                                if let Some(session_id) = get_session_id(&server, parts[2]).await {
+                                    let stream_id = if parts.len() >= 4 {
+                                        parts[3].to_string()
+                                    } else {
+                                        format!("live_stream_{}", session_id)
+                                    };
+                                    
+                                    let command = PlaybackCommand::StopLive {
+                                        stream_id: stream_id.clone(),
+                                    };
+                                    
+                                    match server.send_live_stream_control(session_id, command).await {
+                                        Ok(_) => info!("🛑 Stopped live stream '{}' for session {}", stream_id, session_id),
+                                        Err(e) => error!("Failed to stop live stream: {}", e),
+                                    }
+                                } else {
+                                    info!("Usage: live stop <session_id> [stream_name]");
+                                }
+                            } else {
+                                // 如果没有提供session_id，使用第一个可用的会话
+                                let sessions = server.get_all_sessions().await;
+                                if let Some((session_id, _)) = sessions.first() {
+                                    let stream_id = format!("live_stream_{}", session_id);
+                                    let command = PlaybackCommand::StopLive {
+                                        stream_id: stream_id.clone(),
+                                    };
+                                    
+                                    match server.send_live_stream_control(*session_id, command).await {
+                                        Ok(_) => info!("🛑 Stopped live stream '{}' for session {}", stream_id, session_id),
+                                        Err(e) => error!("Failed to stop live stream: {}", e),
+                                    }
+                                } else {
+                                    info!("Usage: live stop [session_id] [stream_name] - No active sessions available");
+                                }
+                            }
+                        }
+                        
+                        _ => {
+                            info!("Live stream commands:");
+                            info!("  live start [session_id] [stream_name] - Start live streaming");
+                            info!("  live stop [session_id] [stream_name] - Stop live streaming");
+                        }
+                    }
+                } else {
+                    info!("Live stream commands:");
+                    info!("  live start [session_id] [stream_name] - Start live streaming with timestamp overlay");
+                    info!("  live stop [session_id] [stream_name] - Stop live streaming");
+                    info!("  Default quality: 1280x720@30fps, 2Mbps, 1s keyframe interval");
+                }
+            }
 
             "quit" | "exit" => {
                 info!("Shutting down server...");

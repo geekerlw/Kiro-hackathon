@@ -274,6 +274,7 @@ pub enum MessageType {
     PlaybackControl = 0x0C,
     FileListQuery = 0x0D,
     FileListResponse = 0x0E,
+    LiveStreamControl = 0x0F,
 }
 
 // Protocol version information

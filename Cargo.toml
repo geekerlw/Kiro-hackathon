@@ -23,6 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = "4.0"
 rcgen = "0.12"
+# FFmpeg-based live encoding - no additional dependencies needed
 
 [dev-dependencies]
 proptest = "1.0"
@@ -44,17 +45,7 @@ path = "src/bin/mock_server.rs"
 name = "client"
 path = "src/bin/client.rs"
 
-[[bin]]
-name = "test-file-transfer"
-path = "src/bin/test_file_transfer.rs"
 
-[[bin]]
-name = "demo-low-latency"
-path = "src/bin/demo_low_latency.rs"
-
-[[bin]]
-name = "transmission-benchmark"
-path = "src/bin/transmission_benchmark.rs"
 
 [[example]]
 name = "keyframe_index_demo"
